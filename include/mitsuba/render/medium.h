@@ -33,6 +33,20 @@ public:
                                 Mask active = true) const = 0;
 
     /**
+     * \brief Returns the single-scattering albedo (Sigma_s / Sigma_t)
+     * evaluated at a given MediumInteraction mi
+     *
+     * The default implementation computes the ratio from
+     * \ref get_scattering_coefficients(). Media that store the albedo as an
+     * independent quantity (e.g. \c homogeneous and \c heterogeneous)
+     * override this with a direct lookup, which is cheaper and, when
+     * differentiated, attaches the result directly to the albedo parameter
+     * without spurious extinction terms in the AD graph.
+     */
+    virtual UnpolarizedSpectrum
+    get_albedo(const MediumInteraction3f &mi, Mask active = true) const;
+
+    /**
      * \brief Sample a free-flight distance in the medium.
      *
      * This function samples a (tentative) free-flight distance according to an
@@ -122,6 +136,7 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Medium)
     DRJIT_CALL_GETTER(is_homogeneous)
     DRJIT_CALL_GETTER(has_spectral_extinction)
     DRJIT_CALL_METHOD(get_majorant)
+    DRJIT_CALL_METHOD(get_albedo)
     DRJIT_CALL_METHOD(intersect_aabb)
     DRJIT_CALL_METHOD(sample_interaction)
     DRJIT_CALL_METHOD(transmittance_eval_pdf)

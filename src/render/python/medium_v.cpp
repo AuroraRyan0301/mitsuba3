@@ -15,7 +15,7 @@
 MI_VARIANT class PyMedium : public Medium<Float, Spectrum> {
 public:
     MI_IMPORT_TYPES(Medium, Sampler, Scene)
-    NB_TRAMPOLINE(Medium, 6);
+    NB_TRAMPOLINE(Medium, 7);
 
     PyMedium(const Properties &props) : Medium(props) {}
 
@@ -30,6 +30,10 @@ public:
     std::tuple<UnpolarizedSpectrum, UnpolarizedSpectrum, UnpolarizedSpectrum>
     get_scattering_coefficients(const MediumInteraction3f &mi, Mask active = true) const override {
         NB_OVERRIDE_PURE(get_scattering_coefficients, mi, active);
+    }
+
+    UnpolarizedSpectrum get_albedo(const MediumInteraction3f &mi, Mask active = true) const override {
+        NB_OVERRIDE(get_albedo, mi, active);
     }
 
     std::string to_string() const override {
@@ -73,6 +77,12 @@ template <typename Ptr, typename Cls> void bind_medium_generic(Cls &cls) {
                 return ptr->get_majorant(mi, active); },
             "mi"_a, "active"_a=true,
             D(Medium, get_majorant))
+       .def("get_albedo",
+            [](Ptr ptr, const MediumInteraction3f &mi, Mask active) {
+                return ptr->get_albedo(mi, active); },
+            "mi"_a, "active"_a=true,
+            "Returns the single-scattering albedo (Sigma_s / Sigma_t) "
+            "evaluated at a given MediumInteraction mi")
        .def("intersect_aabb",
             [](Ptr ptr, const Ray3f &ray) {
                 return ptr->intersect_aabb(ray); },

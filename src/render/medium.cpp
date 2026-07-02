@@ -95,6 +95,16 @@ Medium<Float, Spectrum>::transmittance_eval_pdf(const MediumInteraction3f &mi,
     return { tr, pdf };
 }
 
+MI_VARIANT
+typename Medium<Float, Spectrum>::UnpolarizedSpectrum
+Medium<Float, Spectrum>::get_albedo(const MediumInteraction3f &mi,
+                                    Mask active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::MediumEvaluate, active);
+
+    auto [sigma_s, sigma_n, sigma_t] = get_scattering_coefficients(mi, active);
+    return dr::select(sigma_t > 0.f, sigma_s / sigma_t, 0.f);
+}
+
 MI_IMPLEMENT_TRAVERSE_CB(Medium, Object)
 MI_INSTANTIATE_CLASS(Medium)
 NAMESPACE_END(mitsuba)

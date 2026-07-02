@@ -303,10 +303,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 weight[act_medium_scatter] *= dr.detach(mei.sigma_s) / scatter_prob
                 throughput *= weight  # (all factors above are detached)
 
-                # Attached single-scattering albedo at the vertex.
-                # TODO: replace with a dedicated Medium::get_albedo() C++ hook.
+                # Attached single-scattering albedo at the vertex
+                # (Medium::get_albedo attaches directly to the albedo
+                # parameter, without spurious extinction terms).
                 albedo_v = dr.select(seg_end_scatter,
-                                     mei.sigma_s / dr.maximum(mei.sigma_t, 1e-8),
+                                     medium.get_albedo(mei, seg_end_scatter),
                                      mi.Spectrum(1.0))
                 mei = dr.detach(mei)
 
@@ -533,9 +534,9 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                     res_depth, fin_active)
 
             with dr.resume_grad():
-                sigma_s_r, _, sigma_t_r = \
+                _, _, sigma_t_r = \
                     res_mei.medium.get_scattering_coefficients(res_mei, res_active)
-                albedo_r = sigma_s_r / dr.maximum(sigma_t_r, 1e-8)
+                albedo_r = res_mei.medium.get_albedo(res_mei, res_active)
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)))
                 else:
@@ -614,10 +615,9 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         phase_ctx, phase, nee_dir_sample, within)
 
             with dr.resume_grad():
-                sigma_s_sub, _, sigma_t_sub = \
+                _, _, sigma_t_sub = \
                     medium.get_scattering_coefficients(mei_sub, active)
-                # TODO: replace with a dedicated Medium::get_albedo() C++ hook.
-                albedo_sub = sigma_s_sub / dr.maximum(sigma_t_sub, 1e-8)
+                albedo_sub = medium.get_albedo(mei_sub, active)
 
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     # Complement of the vertex-side power-heuristic weight
