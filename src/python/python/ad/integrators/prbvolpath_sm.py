@@ -65,9 +65,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
      * - linear_cost
        - |bool|
-       - Reserved: reservoir-based segment subsampling that reduces the cost
-         of the adjoint pass from :math:`O(n^2)` to :math:`O(n)` in the path
-         length. Not implemented yet. (Default: |false|)
+       - Reservoir-based segment subsampling: the (expensive) recursive
+         suffix path that estimates indirect in-scattered radiance is traced
+         only *once per path*, at a segment selected with probability
+         proportional to the path throughput, instead of once per segment.
+         This reduces the adjoint cost from :math:`O(n^2)` to :math:`O(n)` in
+         the path length, at the price of somewhat higher gradient variance.
+         Direct-light probes and the matched transmittance term are still
+         evaluated on every segment. (Default: |false|)
 
     This integrator extends the volumetric Path Replay Backpropagation
     integrator (:monosp:`prbvolpath`) with **sample matching** for extinction
@@ -122,12 +127,6 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
-        if self.linear_cost:
-            # TODO: port the reservoir-based O(n) variant
-            # (`volpathfm_linear_sd` in the reference implementation).
-            raise NotImplementedError(
-                'The linear-cost (reservoir subsampling) variant is not '
-                'implemented yet.')
 
     @dr.syntax
     def sample(self,
@@ -203,6 +202,18 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # accumulate the distance traveled across them in `seg_dist`.
         seg_origin = mi.Point3f(ray.o)
         seg_dist = mi.Float(0.0)
+
+        # Reservoir for the linear-cost variant: selects one segment (with
+        # probability proportional to the path throughput) whose main probe
+        # will receive the single, deferred recursive suffix path estimating
+        # indirect in-scattered radiance. Weighted reservoir sampling with
+        # RIS-style reweighting keeps the estimator unbiased.
+        res_wsum = mi.Spectrum(0.0)      # sum of reservoir weights seen
+        res_w = mi.Spectrum(0.0)         # weight of the retained sample
+        res_mei = dr.zeros(mi.MediumInteraction3f)  # retained probe location
+        res_depth = mi.UInt32(0)         # suffix entry depth at that probe
+        res_interval = mi.Float(0.0)     # retained segment length (inv. pdf)
+        res_active = mi.Bool(False)      # reservoir holds a valid sample
 
         while dr.hint(active,
                       label=f"PRB Sample Matching ({mode.name})"):
@@ -323,12 +334,28 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         seg_dist + dr.select(escaped_medium, si.t, mei.t),
                         0.0))
                     suffix_depth = dr.select(escaped_medium, depth + 1, depth)
-                    self._sample_segment_probes(
+                    mei_main = self._sample_segment_probes(
                         scene, medium, channel, alt_sampler, mei,
                         mi.Point3f(seg_origin), mi.Vector3f(ray.d), interval,
                         δL * L,               # adjoint of the transmittance term
                         δL * throughput_seg,  # adjoint of the in-scattering term
-                        nee_dir_sample, suffix_depth, seg_end)
+                        nee_dir_sample, suffix_depth, seg_end,
+                        include_indirect=not self.linear_cost)
+
+                    # (3) Linear-cost variant: instead of tracing a recursive
+                    #     suffix on every segment, retain one segment's main
+                    #     probe in a throughput-weighted reservoir; the
+                    #     deferred suffix is traced once, after the loop.
+                    if dr.hint(self.linear_cost, mode='scalar'):
+                        w = dr.select(seg_end, dr.detach(throughput_seg), 0.0)
+                        res_wsum += w
+                        ratio = dr.mean(dr.select(res_wsum > 0, w / res_wsum, 0.0))
+                        change = seg_end & (alt_sampler.next_1d(seg_end) <= ratio)
+                        res_w[change] = w
+                        res_mei[change] = mei_main
+                        res_depth[change] = suffix_depth
+                        res_interval[change] = interval
+                        res_active |= change
                     # =========================================================
 
                 phase_ctx = mi.PhaseFunctionContext(sampler)
@@ -484,11 +511,47 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
                 active &= (active_surface | active_medium)
 
+        # ---- Linear-cost variant: deferred indirect in-scattering probe ----
+        # Trace the single recursive suffix path at the reservoir-selected
+        # probe and deposit the indirect part of the matched in-scattering
+        # derivative. The RIS weight `wsum * w / mean(w)` replaces the sum of
+        # per-segment `throughput_seg` adjoints, keeping the estimator
+        # unbiased (the transmittance and direct-light terms were already
+        # deposited per segment).
+        if dr.hint(not is_primal and self.linear_cost, mode='scalar'):
+            d = dr.mean(res_w)
+            w_out = dr.select(d > 0, dr.mean(res_wsum) * res_w / d, 0.0)
+            fin_active = res_active & (res_depth < self.max_depth)
+
+            phase_ctx = mi.PhaseFunctionContext(alt_sampler)
+            phase = res_mei.medium.phase_function()
+            phase[~fin_active] = dr.zeros(mi.PhaseFunctionPtr)
+
+            with dr.suspend_grad():
+                ind_Li = self._probe_indirect(
+                    scene, channel, alt_sampler, res_mei, phase_ctx, phase,
+                    res_depth, fin_active)
+
+            with dr.resume_grad():
+                sigma_s_r, _, sigma_t_r = \
+                    res_mei.medium.get_scattering_coefficients(res_mei, res_active)
+                albedo_r = sigma_s_r / dr.maximum(sigma_t_r, 1e-8)
+                if dr.hint(self.use_probe_mis, mode='scalar'):
+                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)))
+                else:
+                    mis_p = mi.Spectrum(1.0)
+                contrib = (sigma_t_r * dr.detach(albedo_r)
+                           + mis_p * dr.detach(sigma_t_r) * albedo_r) \
+                          * (δL * w_out) * ind_Li * res_interval
+                if dr.hint(dr.grad_enabled(contrib), mode='scalar'):
+                    dr.backward(dr.select(res_active, contrib, 0.0))
+
         return L if is_primal else δL, valid_ray, [], L
 
     def _sample_segment_probes(self, scene, medium, channel, alt_sampler, mei,
                                seg_origin, seg_dir, interval, adj_trans, adj_scatt,
-                               nee_dir_sample, suffix_depth, active):
+                               nee_dir_sample, suffix_depth, active,
+                               include_indirect=True):
         """
         Sample-matched gradient probes for one completed path segment
         (adjoint pass only).
@@ -519,17 +582,29 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         phase[~active] = dr.zeros(mi.PhaseFunctionPtr)
 
         contribs = mi.Spectrum(0.0)
+        mei_main = None
         for i in range(n_probes):
             mei_sub.t = alt_sampler.next_1d(active) * interval
             mei_sub.p = dr.fma(seg_dir, mei_sub.t, seg_origin)
 
             with dr.suspend_grad():
                 if i == 0:
-                    # Main probe: direct + one shared recursive suffix path.
-                    nee_Li, ind_Li = self._probe_radiance(
-                        scene, medium, channel, alt_sampler, mei_sub,
-                        phase_ctx, phase, nee_dir_sample, suffix_depth, within)
-                    Li = nee_Li + n_probes * ind_Li
+                    # Snapshot of the main probe (the linear-cost variant may
+                    # retain it in the reservoir for the deferred suffix).
+                    mei_main = mi.MediumInteraction3f(mei_sub)
+                    if include_indirect:
+                        # Main probe: direct + one shared recursive suffix.
+                        nee_Li, ind_Li = self._probe_radiance(
+                            scene, medium, channel, alt_sampler, mei_sub,
+                            phase_ctx, phase, nee_dir_sample, suffix_depth, within)
+                        Li = nee_Li + n_probes * ind_Li
+                    else:
+                        # Linear-cost variant: direct light only; the indirect
+                        # component is deferred to the reservoir-selected
+                        # segment (see the caller).
+                        Li = self._probe_direct(
+                            scene, medium, channel, alt_sampler, mei_sub,
+                            phase_ctx, phase, nee_dir_sample, within)
                 else:
                     # Additional probes: direct lighting only (the indirect
                     # component is amortized over the segment by the factor
@@ -563,6 +638,8 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             if dr.hint(dr.grad_enabled(contribs), mode='scalar'):
                 dr.backward(dr.select(active, contribs, 0.0) * inv_pdf)
 
+        return mei_main
+
     def _probe_radiance(self, scene, medium, channel, alt_sampler, mei_sub,
                         phase_ctx, phase, nee_dir_sample, suffix_depth, active):
         """
@@ -573,8 +650,17 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         """
         nee_Li = self._probe_direct(scene, medium, channel, alt_sampler, mei_sub,
                                     phase_ctx, phase, nee_dir_sample, active)
+        ind_Li = self._probe_indirect(scene, channel, alt_sampler, mei_sub,
+                                      phase_ctx, phase, suffix_depth, active)
+        return dr.select(active, nee_Li, 0.0), ind_Li
 
-        # Phase-sample the suffix direction at the probe
+    def _probe_indirect(self, scene, channel, alt_sampler, mei_sub,
+                        phase_ctx, phase, suffix_depth, active):
+        """
+        Indirect in-scattered radiance at a probe location: phase-sample a
+        direction and trace one detached suffix path by recursively invoking
+        :py:meth:`sample` in primal mode.
+        """
         wo, phase_weight, phase_pdf = phase.sample(
             phase_ctx, mei_sub,
             alt_sampler.next_1d(active), alt_sampler.next_2d(active), active)
@@ -584,7 +670,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         last_scatter = dr.zeros(mi.Interaction3f)
         last_scatter[rec_active] = mei_sub
         state = _SuffixState(depth=mi.UInt32(suffix_depth),
-                             medium=medium,
+                             medium=mi.MediumPtr(mei_sub.medium),
                              last_scatter_event=last_scatter,
                              last_scatter_direction_pdf=dr.select(rec_active, phase_pdf, 1.0),
                              channel=channel,
@@ -593,8 +679,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                                   δL=None, state_in=None, active=rec_active,
                                   path_state=state)
 
-        return (dr.select(active, nee_Li, 0.0),
-                dr.select(rec_active, phase_weight * Li, 0.0))
+        return dr.select(rec_active, phase_weight * Li, 0.0)
 
     def _probe_direct(self, scene, medium, channel, alt_sampler, mei_sub,
                       phase_ctx, phase, nee_dir_sample, active):
