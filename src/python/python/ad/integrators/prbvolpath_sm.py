@@ -1,0 +1,621 @@
+from __future__ import annotations # Delayed parsing of type annotations
+
+import struct
+
+import drjit as dr
+import mitsuba as mi
+
+from .common import mis_weight
+from .prbvolpath import PRBVolpathIntegrator, index_spectrum
+
+
+class _SuffixState:
+    """
+    Plain container used to re-enter :py:meth:`PRBVolpathSMIntegrator.sample`
+    in primal mode, continuing a (detached) suffix path from a gradient probe
+    location inside a medium.
+    """
+    def __init__(self, depth, medium, last_scatter_event,
+                 last_scatter_direction_pdf, channel, active):
+        self.depth = depth
+        self.medium = medium
+        self.last_scatter_event = last_scatter_event
+        self.last_scatter_direction_pdf = last_scatter_direction_pdf
+        self.channel = channel
+        self.active = active
+
+
+class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
+    r"""
+    .. _integrator-prbvolpath_sm:
+
+    Sample-Matching PRB Volumetric Integrator (:monosp:`prbvolpath_sm`)
+    -------------------------------------------------------------------
+
+    .. pluginparameters::
+
+     * - max_depth
+       - |int|
+       - Specifies the longest path depth in the generated output image (where -1
+         corresponds to :math:`\infty`). (Default: 6)
+
+     * - rr_depth
+       - |int|
+       - Specifies the path depth, at which the implementation will begin to use
+         the *russian roulette* path termination criterion. (Default: 5)
+
+     * - hide_emitters
+       - |bool|
+       - Hide directly visible emitters. (Default: no, i.e. |false|)
+
+     * - probes_per_segment
+       - |int|
+       - Number of gradient probe locations placed on each completed path
+         segment inside a medium (the parameter :math:`\Lambda` in the paper).
+         The first probe estimates direct *and* indirect in-scattered radiance
+         (the latter via one recursive suffix path shared by the whole
+         segment); additional probes only estimate direct lighting.
+         (Default: 1; the paper uses 4)
+
+     * - use_probe_mis
+       - |bool|
+       - Combine the vertex-side (free-flight) and probe-side (uniform)
+         estimators of the albedo-weighted in-scattering derivative using the
+         power heuristic. (Default: |true|)
+
+     * - linear_cost
+       - |bool|
+       - Reserved: reservoir-based segment subsampling that reduces the cost
+         of the adjoint pass from :math:`O(n^2)` to :math:`O(n)` in the path
+         length. Not implemented yet. (Default: |false|)
+
+    This integrator extends the volumetric Path Replay Backpropagation
+    integrator (:monosp:`prbvolpath`) with **sample matching** for extinction
+    (:monosp:`sigma_t`) gradients:
+
+    Differentiating volumetric transport with respect to the extinction
+    coefficient yields two contributions with opposite signs — a *scattering*
+    term (a density increase scatters more light toward the camera) and a
+    *transmittance* term (a density increase attenuates all light passing
+    through). Conventional estimators (e.g. differentiable delta tracking as
+    used by :monosp:`prbvolpath`) evaluate the two terms at *different*
+    locations, leaving their negative correlation unexploited. This integrator
+    instead evaluates both terms at **shared, uniformly-sampled probe
+    locations** on each path segment, activating the negative covariance and
+    substantially reducing extinction-gradient variance without introducing
+    bias.
+
+    In primal mode this integrator behaves exactly like :monosp:`prbvolpath`.
+    All sample-matching machinery only runs in the adjoint (backward) pass.
+
+    Properties (inherited from :monosp:`prbvolpath`):
+
+    - Emitter sampling (NEE), Russian roulette, surfaces + multiple media.
+    - No projective sampling: geometric parameters (e.g. vertex positions)
+      receive incorrect gradients.
+    - Detached sampling: parameters of ideal specular objects cannot be
+      optimized.
+    - Forward-mode differentiation is not supported.
+
+    See "Sample Matching for Joint Extinction Gradient Estimation in
+    Differentiable Volume Rendering" (Yu et al., ACM TOG 45(4), 2026,
+    https://doi.org/10.1145/3811329) for details, and
+    :cite:`Vicini2021` for the underlying PRB framework.
+
+    .. warning::
+        This integrator is not supported in variants which track polarization
+        states.
+
+    .. tabs::
+
+        .. code-tab:: python
+
+            'type': 'prbvolpath_sm',
+            'max_depth': 8,
+            'probes_per_segment': 4
+    """
+    def __init__(self, props):
+        super().__init__(props)
+        self.probes_per_segment = props.get('probes_per_segment', 1)
+        self.use_probe_mis = props.get('use_probe_mis', True)
+        self.linear_cost = props.get('linear_cost', False)
+
+        if self.probes_per_segment < 1:
+            raise Exception('"probes_per_segment" must be >= 1')
+        if self.linear_cost:
+            # TODO: port the reservoir-based O(n) variant
+            # (`volpathfm_linear_sd` in the reference implementation).
+            raise NotImplementedError(
+                'The linear-cost (reservoir subsampling) variant is not '
+                'implemented yet.')
+
+    @dr.syntax
+    def sample(self,
+               mode: dr.ADMode,
+               scene: mi.Scene,
+               sampler: mi.Sampler,
+               ray: mi.Ray3f,
+               δL: Optional[mi.Spectrum],
+               state_in: Optional[mi.Spectrum],
+               active: mi.Bool,
+               path_state=None,
+               **kwargs # Absorbs unused arguments
+    ) -> Tuple[mi.Spectrum, mi.Bool, List[mi.Float], mi.Spectrum]:
+        self.prepare_scene(scene)
+
+        if mode == dr.ADMode.Forward:
+            raise RuntimeError("PRBVolpathSMIntegrator doesn't support "
+                               "forward-mode differentiation!")
+
+        is_primal = mode == dr.ADMode.Primal
+
+        ray = mi.Ray3f(ray)
+        L = mi.Spectrum(0 if is_primal else state_in) # Radiance accumulator
+        δL = mi.Spectrum(δL if δL is not None else 0) # Differential/adjoint radiance
+        throughput = mi.Spectrum(1)                   # Path throughput weight
+        η = mi.Float(1)                               # Index of refraction
+        active = mi.Bool(active)
+
+        si = dr.zeros(mi.SurfaceInteraction3f)
+        needs_intersection = mi.Bool(True)
+        valid_ray = mi.Bool(False)
+
+        if path_state is not None:
+            # Re-entry: continue a detached suffix path from a probe location
+            # (only used by the adjoint pass; the recursion itself is primal).
+            if not is_primal:
+                raise RuntimeError('Recursive suffix rays must be traced in primal mode')
+            depth = mi.UInt32(path_state.depth)
+            medium = mi.MediumPtr(path_state.medium)
+            last_scatter_event = mi.Interaction3f(path_state.last_scatter_event)
+            last_scatter_direction_pdf = mi.Float(path_state.last_scatter_direction_pdf)
+            channel = mi.UInt32(path_state.channel)
+            specular_chain = mi.Bool(False)
+        else:
+            depth = mi.UInt32(0)
+            last_scatter_event = dr.zeros(mi.Interaction3f)
+            last_scatter_direction_pdf = mi.Float(1.0)
+            # TODO: support sensors inside media
+            medium = dr.zeros(mi.MediumPtr)
+            specular_chain = mi.Bool(True)
+            channel = 0
+            if mi.is_rgb:
+                # Sample a color channel to sample free-flight distances
+                n_channels = dr.size_v(mi.Spectrum)
+                channel = mi.UInt32(dr.minimum(n_channels * sampler.next_1d(active), n_channels - 1))
+
+        # Secondary sampler driving all probe/suffix estimation in the adjoint.
+        # One primary sample is consumed in *both* passes so that the primary
+        # random number sequence stays aligned between primal and adjoint
+        # (required by path replay).
+        alt_seed_f = sampler.next_1d(active)
+        alt_sampler = None
+        if dr.hint(not is_primal, mode='scalar'):
+            alt_seed = struct.unpack('!I', struct.pack('!f', alt_seed_f[0]))[0]
+            alt_sampler = sampler.fork()
+            alt_sampler.seed(mi.sample_tea_32(alt_seed, 1)[0],
+                             sampler.wavefront_size())
+        del alt_seed_f
+
+        # Sample-matching segment state: a "segment" spans from the last real
+        # scatter vertex (or last surface interaction) to the next one. Null
+        # interactions do not end a segment: the direction is unchanged, so we
+        # accumulate the distance traveled across them in `seg_dist`.
+        seg_origin = mi.Point3f(ray.o)
+        seg_dist = mi.Float(0.0)
+
+        while dr.hint(active,
+                      label=f"PRB Sample Matching ({mode.name})"):
+            active &= dr.any(throughput != 0.0)
+
+            #--------------------- Perform russian roulette --------------------
+
+            q = dr.minimum(dr.max(throughput) * dr.square(η), 0.99)
+            perform_rr = (depth > self.rr_depth)
+            active &= (sampler.next_1d(active) < q) | ~perform_rr
+            throughput[perform_rr] = throughput * dr.rcp(q)
+
+            active_medium = active & (medium != None)
+            active_surface = active & ~active_medium
+
+            with dr.resume_grad(when=not is_primal):
+                #--------------------- Sample medium interaction -------------------
+
+                # Handle medium sampling and potential medium escape
+                u = sampler.next_1d(active_medium)
+                mei = medium.sample_interaction(ray, u, channel, active_medium)
+                mei.t = dr.detach(mei.t)
+
+                ray.maxt[active_medium & medium.is_homogeneous() & mei.is_valid()] = mei.t
+                intersect = needs_intersection & active_medium
+                si[intersect] = scene.ray_intersect(ray, intersect)
+
+                needs_intersection &= ~active_medium
+                mei.t[active_medium & (si.t < mei.t)] = dr.inf
+
+                # Sample matching: the free-flight/transmittance ratio is used
+                # *detached*. The sigma_t derivatives of the path prefix are
+                # estimated by the matched segment probes below instead, where
+                # the transmittance and in-scattering terms share the same
+                # sample locations (activating their negative correlation).
+                tr, free_flight_pdf = medium.transmittance_eval_pdf(mei, si, active_medium)
+                tr_pdf = index_spectrum(free_flight_pdf, channel)
+                weight = mi.Spectrum(1.0)
+                weight[active_medium] *= dr.detach(dr.select(tr_pdf > 0.0, tr / tr_pdf, 0.0))
+
+                escaped_medium = active_medium & ~mei.is_valid()
+                active_medium &= mei.is_valid()
+
+                # NEE direction sample for this bounce, shared between the
+                # path vertex and all gradient probes of the segment (the
+                # emitter sample is "matched" as well).
+                nee_dir_sample = sampler.next_2d(active)
+
+                # Handle null and real scatter events
+                if dr.hint(self.handle_null_scattering, mode='scalar'):
+                    scatter_prob = dr.detach(dr.mean(mei.sigma_t / mei.combined_extinction))
+                    act_null_scatter = (sampler.next_1d(active_medium) >= scatter_prob) & active_medium
+                    act_medium_scatter = ~act_null_scatter & active_medium
+                    weight[act_null_scatter] *= dr.detach(mei.sigma_n) / (1 - scatter_prob)
+                else:
+                    scatter_prob = mi.Float(1.0)
+                    act_null_scatter = mi.Bool(False)
+                    act_medium_scatter = active_medium
+
+                depth[act_medium_scatter] += 1
+                last_scatter_event[act_medium_scatter] = dr.detach(mei)
+
+                # Segment-end masks, captured *before* the depth cutoff so
+                # that the final path segment still receives its probes.
+                seg_end_scatter = mi.Bool(act_medium_scatter)
+                seg_end = seg_end_scatter | escaped_medium
+
+                # Don't estimate lighting if we exceeded number of bounces
+                active &= depth < self.max_depth
+                act_medium_scatter &= active
+                if dr.hint(self.handle_null_scattering, mode='scalar'):
+                    ray.o[act_null_scatter] = dr.detach(mei.p)
+                    si.t[act_null_scatter] = si.t - dr.detach(mei.t)
+                    seg_dist[act_null_scatter] = seg_dist + dr.detach(mei.t)
+
+                # Path throughput *excluding* the current segment's hop weight
+                # (tr/pdf = 1/majorant for a sampled interaction) and vertex
+                # scattering coefficient — the adjoint weight of the probes'
+                # in-scattering term, which re-evaluates sigma_t * albedo at
+                # the probe location in their stead. Note: the hop weight and
+                # vertex factor jointly reduce to `albedo` in expectation
+                # (delta tracking); the probe estimator's derivation absorbs
+                # exactly that whole product, so neither factor may appear
+                # here.
+                throughput_seg = mi.Spectrum(throughput)
+
+                weight[act_medium_scatter] *= dr.detach(mei.sigma_s) / scatter_prob
+                throughput *= weight  # (all factors above are detached)
+
+                # Attached single-scattering albedo at the vertex.
+                # TODO: replace with a dedicated Medium::get_albedo() C++ hook.
+                albedo_v = dr.select(seg_end_scatter,
+                                     mei.sigma_s / dr.maximum(mei.sigma_t, 1e-8),
+                                     mi.Spectrum(1.0))
+                mei = dr.detach(mei)
+
+                if dr.hint(not is_primal, mode='scalar'):
+                    # ==================== Sample matching ====================
+                    # (Replaces prbvolpath's attached free-flight weight
+                    # backpropagation.)
+
+                    # (1) Vertex-side albedo derivative, MIS-combined with the
+                    #     probe-side estimator (power heuristic, sigma_t^2).
+                    if dr.hint(self.use_probe_mis and dr.grad_enabled(albedo_v), mode='scalar'):
+                        s2 = dr.square(mei.sigma_t)
+                        mis_v = s2 / (1 + s2)
+                        Lo_alb = dr.detach(dr.select(
+                            seg_end_scatter,
+                            L / dr.maximum(1e-8, dr.detach(albedo_v)), 0.0))
+                        dr.backward(mis_v * δL * albedo_v * Lo_alb)
+
+                    # (2) Matched gradient probes on the completed segment:
+                    #     the transmittance term (-sigma_t) and in-scattering
+                    #     term (+sigma_t * albedo * Li) are evaluated at
+                    #     shared, uniformly-sampled locations.
+                    interval = dr.detach(dr.select(
+                        seg_end,
+                        seg_dist + dr.select(escaped_medium, si.t, mei.t),
+                        0.0))
+                    suffix_depth = dr.select(escaped_medium, depth + 1, depth)
+                    self._sample_segment_probes(
+                        scene, medium, channel, alt_sampler, mei,
+                        mi.Point3f(seg_origin), mi.Vector3f(ray.d), interval,
+                        δL * L,               # adjoint of the transmittance term
+                        δL * throughput_seg,  # adjoint of the in-scattering term
+                        nee_dir_sample, suffix_depth, seg_end)
+                    # =========================================================
+
+                phase_ctx = mi.PhaseFunctionContext(sampler)
+                phase = mei.medium.phase_function()
+                phase[~act_medium_scatter] = dr.zeros(mi.PhaseFunctionPtr)
+
+                #--------------------- Surface Interactions --------------------
+
+                active_surface |= escaped_medium
+                intersect = active_surface & needs_intersection
+                si[intersect] = scene.ray_intersect(ray, intersect)
+
+                # ---------------------- Hide area emitters ----------------------
+
+                if dr.hint(self.hide_emitters, mode='scalar'):
+                    # Are we on the first segment and did we hit an area emitter?
+                    # If so, skip all area emitters along this ray
+                    skip_emitters = (
+                        si.is_valid() &
+                        (si.shape.emitter() != None) &
+                        (depth == 0) &
+                        intersect
+                    )
+
+                    ray_skip = si.spawn_ray(ray.d)
+                    pi = self.skip_area_emitters(scene, ray_skip, True, skip_emitters)
+                    si_after_skip = pi.compute_surface_interaction(ray, mi.RayFlags.All, skip_emitters)
+                    si[skip_emitters] = si_after_skip
+
+                # ----------------- Intersection with emitters -----------------
+
+                ray_from_camera = active_surface & (depth == 0)
+                count_direct = ray_from_camera | specular_chain
+                emitter = si.emitter(scene)
+                active_e = active_surface & (emitter != None) & ~((depth == 0) & self.hide_emitters)
+
+                # Get the PDF of sampling this emitter using next event estimation
+                ds = mi.DirectionSample3f(scene, si, last_scatter_event)
+                if dr.hint(self.use_nee, mode='scalar'):
+                    emitter_pdf = scene.pdf_emitter_direction(last_scatter_event, ds, active_e)
+                else:
+                    emitter_pdf = 0.0
+                emitted = emitter.eval(si, active_e)
+                contrib = dr.select(count_direct, throughput * emitted,
+                                    throughput * mis_weight(last_scatter_direction_pdf, emitter_pdf) * emitted)
+                L[active_e] += dr.detach(contrib if is_primal else -contrib)
+                if dr.hint(not is_primal and dr.grad_enabled(contrib), mode='scalar'):
+                    dr.backward(δL * contrib)
+
+                active_surface &= si.is_valid()
+                ctx = mi.BSDFContext()
+                bsdf = si.bsdf(ray)
+
+                # ---------------------- Emitter sampling ----------------------
+
+                if dr.hint(self.use_nee, mode='scalar'):
+                    active_e_surface = active_surface & mi.has_flag(bsdf.flags(), mi.BSDFFlags.Smooth) & (depth + 1 < self.max_depth)
+                    sample_emitters = mei.medium.use_emitter_sampling()
+                    specular_chain &= ~act_medium_scatter
+                    specular_chain |= act_medium_scatter & ~sample_emitters
+
+                    active_e_medium = act_medium_scatter & sample_emitters
+                    active_e = active_e_surface | active_e_medium
+
+                    nee_sampler = sampler if is_primal else sampler.clone()
+                    emitted, ds = self.sample_emitter(mei, si, active_e_medium, active_e_surface,
+                        scene, sampler, medium, channel, active_e, mode=dr.ADMode.Primal,
+                        dir_sample=nee_dir_sample)
+
+                    # Query the BSDF for that emitter-sampled direction
+                    bsdf_val, bsdf_pdf = bsdf.eval_pdf(ctx, si, si.to_local(ds.d), active_e_surface)
+                    phase_val, phase_pdf = phase.eval_pdf(phase_ctx, mei, ds.d, active_e_medium)
+                    nee_weight = dr.select(active_e_surface, bsdf_val, phase_val)
+                    nee_directional_pdf = dr.select(ds.delta, 0.0, dr.select(active_e_surface, bsdf_pdf, phase_pdf))
+
+                    contrib = throughput * nee_weight * mis_weight(ds.pdf, nee_directional_pdf) * emitted
+                    L[active_e] += dr.detach(contrib if is_primal else -contrib)
+
+                    if dr.hint(not is_primal, mode='scalar'):
+                        self.sample_emitter(mei, si, active_e_medium, active_e_surface,
+                            scene, nee_sampler, medium, channel, active_e, adj_emitted=contrib,
+                            δL=δL, mode=mode, dir_sample=nee_dir_sample)
+
+                        if dr.hint(dr.grad_enabled(nee_weight) or dr.grad_enabled(emitted), mode='scalar'):
+                            dr.backward(δL * contrib)
+
+                #-------------------- Phase function sampling ------------------
+
+                valid_ray |= act_medium_scatter
+                with dr.suspend_grad():
+                    wo, phase_weight, phase_pdf = phase.sample(phase_ctx, mei,
+                                                               sampler.next_1d(act_medium_scatter),
+                                                               sampler.next_2d(act_medium_scatter),
+                                                               act_medium_scatter)
+                act_medium_scatter &= phase_pdf > 0.0
+
+                # Re evaluate the phase function value in an attached manner
+                phase_eval, _ = phase.eval_pdf(phase_ctx, mei, wo, act_medium_scatter)
+                if dr.hint(not is_primal and dr.grad_enabled(phase_eval), mode='scalar'):
+                    Lo = phase_eval * dr.detach(dr.select(act_medium_scatter, L / dr.maximum(1e-8, phase_eval), 0.0))
+                    if mode == dr.ADMode.Backward:
+                        dr.backward_from(δL * Lo)
+                    else:
+                        δL += dr.forward_to(Lo)
+
+                throughput[act_medium_scatter] *= phase_weight
+                ray[act_medium_scatter] = mei.spawn_ray(wo)
+                needs_intersection |= act_medium_scatter
+                last_scatter_direction_pdf[act_medium_scatter] = phase_pdf
+
+                # ------------------------ BSDF sampling -----------------------
+
+                with dr.suspend_grad():
+                    bs, bsdf_weight = bsdf.sample(ctx, si,
+                                                  sampler.next_1d(active_surface),
+                                                  sampler.next_2d(active_surface),
+                                                  active_surface)
+                    active_surface &= bs.pdf > 0
+
+                bsdf_eval = bsdf.eval(ctx, si, bs.wo, active_surface)
+
+                if dr.hint(not is_primal and dr.grad_enabled(bsdf_eval), mode='scalar'):
+                    Lo = bsdf_eval * dr.detach(dr.select(active_surface, L / dr.maximum(1e-8, bsdf_eval), 0.0))
+                    if dr.hint(mode == dr.ADMode.Backward, mode='scalar'):
+                        dr.backward_from(δL * Lo)
+                    else:
+                        δL += dr.forward_to(Lo)
+
+                throughput[active_surface] *= bsdf_weight
+                η[active_surface] *= bs.eta
+                bsdf_ray = si.spawn_ray(si.to_world(bs.wo))
+                ray[active_surface] = bsdf_ray
+
+                needs_intersection |= active_surface
+                non_null_bsdf = active_surface & ~mi.has_flag(bs.sampled_type, mi.BSDFFlags.Null)
+                depth[non_null_bsdf] += 1
+
+                # update the last scatter PDF event if we encountered a non-null scatter event
+                last_scatter_event[non_null_bsdf] = si
+                last_scatter_direction_pdf[non_null_bsdf] = bs.pdf
+
+                valid_ray |= non_null_bsdf
+                specular_chain |= non_null_bsdf & mi.has_flag(bs.sampled_type, mi.BSDFFlags.Delta)
+                specular_chain &= ~(active_surface & mi.has_flag(bs.sampled_type, mi.BSDFFlags.Smooth))
+                has_medium_trans = active_surface & si.is_medium_transition()
+                medium[has_medium_trans] = si.target_medium(ray.d)
+
+                # A new segment starts at every real scatter vertex and at
+                # every surface interaction (incl. null boundary crossings).
+                seg_origin[act_medium_scatter] = dr.detach(mei.p)
+                seg_origin[active_surface] = dr.detach(si.p)
+                seg_dist[act_medium_scatter | active_surface] = 0.0
+
+                active &= (active_surface | active_medium)
+
+        return L if is_primal else δL, valid_ray, [], L
+
+    def _sample_segment_probes(self, scene, medium, channel, alt_sampler, mei,
+                               seg_origin, seg_dir, interval, adj_trans, adj_scatt,
+                               nee_dir_sample, suffix_depth, active):
+        """
+        Sample-matched gradient probes for one completed path segment
+        (adjoint pass only).
+
+        Places `probes_per_segment` locations uniformly on the segment
+        `seg_origin + t * seg_dir, t in [0, interval]` and deposits, at each
+        probe location `y`:
+
+          - the transmittance derivative  `-sigma_t(y) * adj_trans`, and
+          - the in-scattering derivative  `+d(sigma_t*albedo)(y) * adj_scatt * Li(y)`,
+
+        where both terms share the *same* `sigma_t(y)` evaluation — this is
+        the sample-matching estimator that activates the negative correlation
+        between the two terms. `Li(y)` is decomposed into direct lighting
+        (estimated at every probe with a shared NEE direction sample) and
+        indirect lighting (estimated with a single recursive suffix path,
+        shared by the whole segment).
+        """
+        n_probes = self.probes_per_segment
+        within = active & (suffix_depth < self.max_depth)
+
+        # Probe interactions inherit the frame/wavelengths/medium pointer of
+        # the segment's medium interaction; only position/distance change.
+        mei_sub = mi.MediumInteraction3f(mei)
+
+        phase_ctx = mi.PhaseFunctionContext(alt_sampler)
+        phase = mei_sub.medium.phase_function()
+        phase[~active] = dr.zeros(mi.PhaseFunctionPtr)
+
+        contribs = mi.Spectrum(0.0)
+        for i in range(n_probes):
+            mei_sub.t = alt_sampler.next_1d(active) * interval
+            mei_sub.p = dr.fma(seg_dir, mei_sub.t, seg_origin)
+
+            with dr.suspend_grad():
+                if i == 0:
+                    # Main probe: direct + one shared recursive suffix path.
+                    nee_Li, ind_Li = self._probe_radiance(
+                        scene, medium, channel, alt_sampler, mei_sub,
+                        phase_ctx, phase, nee_dir_sample, suffix_depth, within)
+                    Li = nee_Li + n_probes * ind_Li
+                else:
+                    # Additional probes: direct lighting only (the indirect
+                    # component is amortized over the segment by the factor
+                    # `n_probes` above).
+                    Li = self._probe_direct(
+                        scene, medium, channel, alt_sampler, mei_sub,
+                        phase_ctx, phase, nee_dir_sample, within)
+
+            with dr.resume_grad():
+                sigma_s_sub, _, sigma_t_sub = \
+                    medium.get_scattering_coefficients(mei_sub, active)
+                # TODO: replace with a dedicated Medium::get_albedo() C++ hook.
+                albedo_sub = sigma_s_sub / dr.maximum(sigma_t_sub, 1e-8)
+
+                if dr.hint(self.use_probe_mis, mode='scalar'):
+                    # Complement of the vertex-side power-heuristic weight
+                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_sub)))
+                else:
+                    mis_p = mi.Spectrum(1.0)
+
+                # Matched estimator: both terms below evaluate sigma_t at the
+                # *same* location `mei_sub.p`.
+                contribs -= sigma_t_sub * adj_trans
+                contribs += (sigma_t_sub * dr.detach(albedo_sub)
+                             + mis_p * dr.detach(sigma_t_sub) * albedo_sub) \
+                            * adj_scatt * Li
+
+        # Uniform probe placement: pdf = 1 / interval (per probe)
+        inv_pdf = interval / n_probes
+        with dr.resume_grad():
+            if dr.hint(dr.grad_enabled(contribs), mode='scalar'):
+                dr.backward(dr.select(active, contribs, 0.0) * inv_pdf)
+
+    def _probe_radiance(self, scene, medium, channel, alt_sampler, mei_sub,
+                        phase_ctx, phase, nee_dir_sample, suffix_depth, active):
+        """
+        Estimate the in-scattered radiance at a probe location, decomposed
+        into (direct NEE, indirect) components. The indirect component traces
+        one detached suffix path by recursively invoking :py:meth:`sample` in
+        primal mode.
+        """
+        nee_Li = self._probe_direct(scene, medium, channel, alt_sampler, mei_sub,
+                                    phase_ctx, phase, nee_dir_sample, active)
+
+        # Phase-sample the suffix direction at the probe
+        wo, phase_weight, phase_pdf = phase.sample(
+            phase_ctx, mei_sub,
+            alt_sampler.next_1d(active), alt_sampler.next_2d(active), active)
+        rec_active = active & (phase_pdf > 0.0)
+        rec_ray = mei_sub.spawn_ray(wo)
+
+        last_scatter = dr.zeros(mi.Interaction3f)
+        last_scatter[rec_active] = mei_sub
+        state = _SuffixState(depth=mi.UInt32(suffix_depth),
+                             medium=medium,
+                             last_scatter_event=last_scatter,
+                             last_scatter_direction_pdf=dr.select(rec_active, phase_pdf, 1.0),
+                             channel=channel,
+                             active=rec_active)
+        Li, _, _, _ = self.sample(dr.ADMode.Primal, scene, alt_sampler, rec_ray,
+                                  δL=None, state_in=None, active=rec_active,
+                                  path_state=state)
+
+        return (dr.select(active, nee_Li, 0.0),
+                dr.select(rec_active, phase_weight * Li, 0.0))
+
+    def _probe_direct(self, scene, medium, channel, alt_sampler, mei_sub,
+                      phase_ctx, phase, nee_dir_sample, active):
+        """
+        Direct lighting (NEE) at a probe location, using the segment's shared
+        emitter direction sample and MIS against phase sampling.
+        """
+        emitted, ds = self.sample_emitter(
+            mei_sub, dr.zeros(mi.SurfaceInteraction3f), active, mi.Bool(False),
+            scene, alt_sampler, medium, channel, active,
+            mode=dr.ADMode.Primal, dir_sample=nee_dir_sample)
+        phase_val, phase_pdf = phase.eval_pdf(phase_ctx, mei_sub, ds.d, active)
+        nee_directional_pdf = dr.select(ds.delta, 0.0, phase_pdf)
+        return dr.select(active,
+                         phase_val * mis_weight(ds.pdf, nee_directional_pdf) * emitted,
+                         0.0)
+
+    def to_string(self):
+        return (f'PRBVolpathSMIntegrator[max_depth = {self.max_depth}, '
+                f'probes_per_segment = {self.probes_per_segment}]')
+
+mi.register_integrator("prbvolpath_sm", lambda props: PRBVolpathSMIntegrator(props))
+
+del PRBVolpathIntegrator

@@ -352,7 +352,7 @@ class PRBVolpathIntegrator(RBIntegrator):
 
     @dr.syntax
     def sample_emitter(self, mei, si, active_medium, active_surface, scene, sampler, medium, channel,
-                       active, adj_emitted=None, δL=None, mode=None):
+                       active, adj_emitted=None, δL=None, mode=None, dir_sample=None):
         is_primal = mode == dr.ADMode.Primal
 
         active = mi.Bool(active)
@@ -361,8 +361,14 @@ class PRBVolpathIntegrator(RBIntegrator):
         ref_interaction[active_medium] = mei
         ref_interaction[active_surface] = si
 
+        # An externally-provided direction sample allows correlating this
+        # emitter sample with other estimators (e.g. `prbvolpath_sm` evaluates
+        # matched gradient probes with the same emitter direction sample).
+        if dir_sample is None:
+            dir_sample = sampler.next_2d(active)
+
         ds, emitter_val = scene.sample_emitter_direction(ref_interaction,
-                                                         sampler.next_2d(active),
+                                                         dir_sample,
                                                          False, active)
         ds = dr.detach(ds)
         invalid = (ds.pdf == 0.0)
