@@ -3,6 +3,7 @@
 #include <mitsuba/core/object.h>
 #include <mitsuba/core/spectrum.h>
 #include <mitsuba/core/traits.h>
+#include <mitsuba/core/transform.h>
 #include <mitsuba/render/fwd.h>
 #include <drjit/call.h>
 
@@ -11,7 +12,7 @@ NAMESPACE_BEGIN(mitsuba)
 template <typename Float, typename Spectrum>
 class MI_EXPORT_LIB Medium : public JitObject<Medium<Float, Spectrum>> {
 public:
-    MI_IMPORT_TYPES(PhaseFunction, Sampler, Scene, Texture);
+    MI_IMPORT_TYPES(PhaseFunction, Sampler, Scene, Texture, Volume);
 
     /// Destructor
     ~Medium();
@@ -103,6 +104,11 @@ public:
         return m_has_spectral_extinction;
     }
 
+    /// Returns whether a majorant supergrid is available for delta tracking
+    MI_INLINE bool has_majorant_grid() const {
+        return m_majorant_grid_res.x() > 0;
+    }
+
     void traverse(TraversalCallback *callback) override;
 
     /// Return a human-readable representation of the Medium
@@ -114,13 +120,49 @@ protected:
     Medium();
     Medium(const Properties &props);
 
+    /**
+     * \brief (Re-)build the majorant supergrid from the given extinction
+     * volume, scaled by \c scale and inflated by \c m_majorant_factor.
+     *
+     * The supergrid is *derived* data (like a BVH): it is recomputed in
+     * \c parameters_changed() and detached from the AD graph. A no-op when
+     * \c majorant_resolution_factor is zero.
+     */
+    void update_majorant_grid(const Volume *volume, ScalarFloat scale);
+
+    /// Conservative per-cell majorant lookup (nearest cell)
+    Float majorant_grid_eval(const Point3f &p, Mask active) const;
+
+    /**
+     * \brief Sample a free-flight distance against the piecewise-constant
+     * majorant supergrid using a DDA traversal.
+     *
+     * Returns the sampled distance along the ray, the local majorant of the
+     * cell containing the sample, and a validity mask (false = the target
+     * optical depth was not reached before \c maxt, i.e. the ray escaped).
+     */
+    std::tuple<Float, Float, Mask>
+    sample_interaction_dda(const Ray3f &ray, Float mint, Float maxt,
+                           Float sample, Mask active) const;
+
 protected:
     ref<PhaseFunction> m_phase_function;
     bool m_sample_emitters;
     bool m_is_homogeneous;
     bool m_has_spectral_extinction;
 
-    MI_DECLARE_TRAVERSE_CB(m_phase_function)
+    /// Majorant supergrid resolution divisor (0 = disabled, global majorant)
+    uint32_t m_majorant_resolution_factor;
+    /// Safety factor applied on top of the per-cell maxima
+    ScalarFloat m_majorant_factor;
+    /// Derived majorant supergrid (x-fastest layout), detached
+    DynamicBuffer<Float> m_majorant_grid;
+    /// Supergrid resolution; (0, 0, 0) when disabled
+    ScalarVector3u m_majorant_grid_res;
+    /// World-to-local transform of the extinction volume
+    ScalarAffineTransform4f m_majorant_to_local;
+
+    MI_DECLARE_TRAVERSE_CB(m_phase_function, m_majorant_grid)
 };
 
 MI_EXTERN_CLASS(Medium)

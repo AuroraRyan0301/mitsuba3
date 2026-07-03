@@ -149,7 +149,8 @@ template <typename Float, typename Spectrum>
 class HeterogeneousMedium final : public Medium<Float, Spectrum> {
 public:
     MI_IMPORT_BASE(Medium, m_is_homogeneous, m_has_spectral_extinction,
-                    m_phase_function)
+                    m_phase_function, has_majorant_grid, majorant_grid_eval,
+                    update_majorant_grid)
     MI_IMPORT_TYPES(Scene, Sampler, Texture, Volume)
 
     HeterogeneousMedium(const Properties &props) : Base(props) {
@@ -161,6 +162,7 @@ public:
         m_has_spectral_extinction = props.get<bool>("has_spectral_extinction", true);
 
         m_max_density = dr::opaque<Float>(m_scale * m_sigmat->max());
+        update_majorant_grid(m_sigmat.get(), m_scale);
     }
 
     void traverse(TraversalCallback *cb) override {
@@ -172,12 +174,16 @@ public:
 
     void parameters_changed(const std::vector<std::string> &/*keys*/ = {}) override {
         m_max_density = dr::opaque<Float>(m_scale * m_sigmat->max());
+        update_majorant_grid(m_sigmat.get(), m_scale);
     }
 
     UnpolarizedSpectrum
-    get_majorant(const MediumInteraction3f & /* mi */,
+    get_majorant(const MediumInteraction3f &mi,
                  Mask active) const override {
         MI_MASKED_FUNCTION(ProfilerPhase::MediumEvaluate, active);
+        if (has_majorant_grid())
+            return UnpolarizedSpectrum(majorant_grid_eval(mi.p, active)) & active;
+        DRJIT_MARK_USED(mi);
         return m_max_density;
     }
 
@@ -191,7 +197,11 @@ public:
             sigmat *= m_phase_function->projected_area(mi, active);
 
         auto sigmas = sigmat * m_albedo->eval(mi, active);
-        auto sigman = m_max_density - sigmat;
+        UnpolarizedSpectrum majorant =
+            has_majorant_grid()
+                ? UnpolarizedSpectrum(majorant_grid_eval(mi.p, active))
+                : UnpolarizedSpectrum(m_max_density);
+        auto sigman = dr::maximum(majorant - sigmat, 0.f);
         return { sigmas, sigman, sigmat };
     }
 
