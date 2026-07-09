@@ -90,6 +90,14 @@ MI_VARIANT Scene<Float, Spectrum>::Scene(const Properties &props)
     props.mark_queried("kd_retract_bad_splits");
     props.mark_queried("kd_exact_primitive_threshold");
 
+    /* Analytic AABB fast path: replaces every ray intersection with a slab
+       test against the single shape's bounding box. Only valid for scenes
+       with exactly one (convex, box-like) shape, e.g. pure-volume setups. */
+    m_use_bbox_fast_path = props.get<bool>("use_bbox_fast_path", false);
+    if (m_use_bbox_fast_path && m_shapes.size() != 1)
+        Throw("use_bbox_fast_path requires exactly one shape in the scene "
+              "(found %zu).", m_shapes.size());
+
     m_accel.init(this, props);
     clear_shapes_dirty();
 
@@ -206,6 +214,44 @@ Scene<Float, Spectrum>::ray_intersect(const Ray3f &ray, uint32_t ray_flags,
     DRJIT_MARK_USED(reorder_hint);
     DRJIT_MARK_USED(reorder_hint_bits);
 
+    if (m_use_bbox_fast_path) {
+        // Analytic single-AABB intersection (no acceleration structure)
+        SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
+
+        const Shape *shape = m_shapes[0].get();
+        const ScalarBoundingBox3f bbox = shape->bbox();
+
+        auto [hit, mint, maxt] = bbox.ray_intersect(ray);
+        Mask starts_outside = mint > 0.f;
+        Float t = dr::select(starts_outside, mint, maxt);
+        hit &= active && (t <= ray.maxt) && (t > math::RayEpsilon<Float>);
+        si.t = dr::select(hit, t, dr::Infinity<Float>);
+
+        si.time = ray.time;
+        si.wavelengths = ray.wavelengths;
+        si.p = ray(si.t);
+
+        /* Axis-aligned box normal: the local axis with the largest
+           coordinate magnitude, oriented outward. */
+        Point3f p_local = (si.p - bbox.center()) / bbox.extents();
+        Point3f p_local_abs = dr::abs(p_local);
+        Float vmax = dr::max(p_local_abs);
+        Normal3f n(dr::select(p_local_abs.x() == vmax, 1.f, 0.f),
+                   dr::select(p_local_abs.y() == vmax, 1.f, 0.f),
+                   dr::select(p_local_abs.z() == vmax, 1.f, 0.f));
+        n = dr::normalize(dr::sign(p_local) * n);
+        si.n = dr::select(hit, n, -ray.d);
+
+        si.shape = dr::select(hit, dr::opaque<ShapePtr>(shape),
+                              dr::zeros<ShapePtr>());
+        si.uv = 0.f;
+        si.sh_frame.n = si.n;
+        if (has_flag(ray_flags, RayFlags::ShadingFrame))
+            si.initialize_sh_frame();
+        si.wi = dr::select(hit, si.to_local(-ray.d), -ray.d);
+        return si;
+    }
+
     // Locate the intersection using the backend, then expand it into a full
     // SurfaceInteraction. This composition is backend-independent.
     PreliminaryIntersection3f pi = m_accel.ray_intersect_preliminary(
@@ -233,6 +279,15 @@ MI_VARIANT typename Scene<Float, Spectrum>::Mask
 Scene<Float, Spectrum>::ray_test(const Ray3f &ray, Mask coherent, Mask active) const {
     MI_MASKED_FUNCTION(ProfilerPhase::RayTest, active);
     DRJIT_MARK_USED(coherent);
+
+    if (m_use_bbox_fast_path) {
+        const ScalarBoundingBox3f bbox = m_shapes[0]->bbox();
+        auto [hit, mint, maxt] = bbox.ray_intersect(ray);
+        Mask starts_outside = mint > 0.f;
+        Float t = dr::select(starts_outside, mint, maxt);
+        return active && hit && (t <= ray.maxt) &&
+               (t > math::RayEpsilon<Float>);
+    }
 
     return m_accel.ray_test(this, ray, coherent, active);
 }

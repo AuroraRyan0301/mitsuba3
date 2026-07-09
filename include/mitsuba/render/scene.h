@@ -801,6 +801,8 @@ protected:
     std::unique_ptr<DiscreteDistribution<Float>> m_silhouette_distr = nullptr;
 
     bool m_shapes_grad_enabled;
+    /// Analytic single-AABB intersection fast path (pure-volume scenes)
+    bool m_use_bbox_fast_path = false;
     bool m_thread_reordering;
     /// Compact GPU acceleration structures after building. This reduces BLAS
     /// memory at the cost of an extra build-time query and compaction pass.

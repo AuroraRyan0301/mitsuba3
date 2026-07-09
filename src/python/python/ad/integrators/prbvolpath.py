@@ -392,7 +392,12 @@ class PRBVolpathIntegrator(RBIntegrator):
 
             # This ray will not intersect if it reached the end of the segment
             needs_intersection &= active
-            si[needs_intersection] = scene.ray_intersect(ray, needs_intersection)
+            # The NEE transmittance walk only consumes si.t/p/n and the shape
+            # pointer (null-transmission + medium transitions); skip the full
+            # shading-frame/UV construction to keep the traced state small.
+            si[needs_intersection] = scene.ray_intersect(
+                ray, ray_flags=mi.RayFlags.Minimal, coherent=mi.Bool(False),
+                active=needs_intersection)
             needs_intersection &= False
 
             active_medium = active & (medium != None)

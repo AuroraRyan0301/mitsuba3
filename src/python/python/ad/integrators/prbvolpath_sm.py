@@ -124,6 +124,15 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         self.probes_per_segment = props.get('probes_per_segment', 1)
         self.use_probe_mis = props.get('use_probe_mis', True)
         self.linear_cost = props.get('linear_cost', False)
+        # Two-stage adjoint: the path-replay loop only appends compact
+        # per-segment records; probe lighting estimation runs afterwards in
+        # a small, coherent kernel of its own. This keeps ray-tracing calls
+        # (and their register-state cost) out of the large replay kernel.
+        self.defer_probes = props.get('defer_probes', True)
+        # Segment-record capacity, as a multiple of the wavefront size.
+        # Records past the capacity are dropped (with a warning); the default
+        # is far above typical volumetric path lengths.
+        self.defer_capacity = props.get('defer_capacity', 16)
 
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
@@ -195,6 +204,22 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             alt_sampler.seed(mi.sample_tea_32(alt_seed, 1)[0],
                              sampler.wavefront_size())
         del alt_seed_f
+
+        # Deferred-probe record buffers (see `defer_probes` in __init__).
+        # Only the top-level adjoint pass defers; recursive suffix rays and
+        # the primal pass never reach the probe code.
+        defer = (not is_primal) and self.defer_probes and (path_state is None)
+        if dr.hint(defer, mode='scalar'):
+            dfr_n = sampler.wavefront_size()
+            dfr_cap = int(dfr_n) * self.defer_capacity
+            dfr_cap_o = dr.opaque(mi.UInt32, dfr_cap)
+            dfr_ctr = dr.zeros(mi.UInt32, 1)
+            dfr = {k: dr.zeros(mi.Float, dfr_cap) for k in
+                   ('ox', 'oy', 'oz', 'dx', 'dy', 'dz', 'itv',
+                    'atx', 'aty', 'atz', 'asx', 'asy', 'asz', 'nu', 'nv')}
+            dfr['dep'] = dr.zeros(mi.UInt32, dfr_cap)
+            dfr['ch'] = dr.zeros(mi.UInt32, dfr_cap)
+            dfr['med'] = dr.zeros(mi.MediumPtr, dfr_cap)
 
         # Sample-matching segment state: a "segment" spans from the last real
         # scatter vertex (or last surface interaction) to the next one. Null
@@ -334,14 +359,46 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         seg_end,
                         seg_dist + dr.select(escaped_medium, si.t, mei.t),
                         0.0))
+                    # Rare geometric edge case: a lane inside the medium whose
+                    # forward intersection failed (si.t = inf) while the DDA
+                    # exhausted the segment -> interval = inf -> probe position
+                    # at infinity -> NaN gradients scattered into clamped
+                    # boundary voxels. Exclude such lanes from probing.
+                    seg_end &= dr.isfinite(interval)
+                    interval = dr.select(seg_end, interval, 0.0)
                     suffix_depth = dr.select(escaped_medium, depth + 1, depth)
-                    mei_main = self._sample_segment_probes(
-                        scene, medium, channel, alt_sampler, mei,
-                        mi.Point3f(seg_origin), mi.Vector3f(ray.d), interval,
-                        δL * L,               # adjoint of the transmittance term
-                        δL * throughput_seg,  # adjoint of the in-scattering term
-                        nee_dir_sample, suffix_depth, seg_end,
-                        include_indirect=not self.linear_cost)
+                    if dr.hint(defer, mode='scalar'):
+                        # Append the segment record; probe estimation happens
+                        # in the compact second-stage kernel after the loop.
+                        at = dr.detach(δL * L)
+                        asc = dr.detach(δL * throughput_seg)
+                        slot = dr.scatter_inc(dfr_ctr, mi.UInt32(0), seg_end)
+                        ok = seg_end & (slot < dfr_cap_o)
+                        for _k, _v in (('ox', seg_origin.x), ('oy', seg_origin.y),
+                                       ('oz', seg_origin.z), ('dx', ray.d.x),
+                                       ('dy', ray.d.y), ('dz', ray.d.z),
+                                       ('itv', interval),
+                                       ('atx', at.x), ('aty', at.y), ('atz', at.z),
+                                       ('asx', asc.x), ('asy', asc.y), ('asz', asc.z),
+                                       ('nu', nee_dir_sample.x), ('nv', nee_dir_sample.y)):
+                            dr.scatter(dfr[_k], dr.detach(_v), slot, ok)
+                        dr.scatter(dfr['dep'], suffix_depth, slot, ok)
+                        dr.scatter(dfr['ch'], channel, slot, ok)
+                        dr.scatter(dfr['med'], medium, slot, ok)
+                        # Reservoir candidate for the deferred indirect suffix
+                        # (linear variant): only the *location* is needed here.
+                        mei_main = mi.MediumInteraction3f(mei)
+                        mei_main.t = alt_sampler.next_1d(seg_end) * interval
+                        mei_main.p = dr.fma(mi.Vector3f(ray.d), mei_main.t,
+                                            mi.Point3f(seg_origin))
+                    else:
+                        mei_main = self._sample_segment_probes(
+                            scene, medium, channel, alt_sampler, mei,
+                            mi.Point3f(seg_origin), mi.Vector3f(ray.d), interval,
+                            δL * L,               # adjoint of the transmittance term
+                            δL * throughput_seg,  # adjoint of the in-scattering term
+                            nee_dir_sample, suffix_depth, seg_end,
+                            include_indirect=not self.linear_cost)
 
                     # (3) Linear-cost variant: instead of tracing a recursive
                     #     suffix on every segment, retain one segment's main
@@ -512,6 +569,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
                 active &= (active_surface | active_medium)
 
+        # ---- Deferred-probe pass: estimate probe lighting in a compact,
+        # coherent kernel of its own (records were appended in the loop). ----
+        if dr.hint(defer, mode='scalar'):
+            self._flush_deferred_probes(scene, dfr, dfr_ctr, dfr_cap)
+
         # ---- Linear-cost variant: deferred indirect in-scattering probe ----
         # Trace the single recursive suffix path at the reservoir-selected
         # probe and deposit the indirect part of the matched in-scattering
@@ -545,9 +607,52 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                            + mis_p * dr.detach(sigma_t_r) * albedo_r) \
                           * (δL * w_out) * ind_Li * res_interval
                 if dr.hint(dr.grad_enabled(contrib), mode='scalar'):
-                    dr.backward(dr.select(res_active, contrib, 0.0))
+                    safe = res_active & dr.all(dr.isfinite(contrib))
+                    dr.backward(dr.select(safe, contrib, 0.0))
 
         return L if is_primal else δL, valid_ray, [], L
+
+    def _flush_deferred_probes(self, scene, dfr, dfr_ctr, dfr_cap):
+        """
+        Second stage of the deferred-probe design: gather the per-segment
+        records written by the path-replay loop and run the (ray-tracing
+        heavy) probe estimation at segment granularity. Reading the record
+        counter forces the replay kernel to execute first, so the probe work
+        lands in a separate, much smaller kernel with compacted lanes.
+        """
+        n_total = int(dfr_ctr[0])
+        n = min(n_total, dfr_cap)
+        if n_total > dfr_cap:
+            mi.Log(mi.LogLevel.Warn,
+                   f'prbvolpath_sm: deferred-probe buffer overflow '
+                   f'({n_total} > {dfr_cap} records); increase '
+                   f'"defer_capacity" to keep the estimator exact.')
+        if n == 0:
+            return
+        idx = dr.arange(mi.UInt32, n)
+        g = lambda k: dr.gather(mi.Float, dfr[k], idx)
+        origin = mi.Point3f(g('ox'), g('oy'), g('oz'))
+        seg_dir = mi.Vector3f(g('dx'), g('dy'), g('dz'))
+        interval = g('itv')
+        adj_trans = mi.Spectrum(g('atx'), g('aty'), g('atz'))
+        adj_scatt = mi.Spectrum(g('asx'), g('asy'), g('asz'))
+        nee_dir = mi.Point2f(g('nu'), g('nv'))
+        suffix_depth = dr.gather(mi.UInt32, dfr['dep'], idx)
+        channel = dr.gather(mi.UInt32, dfr['ch'], idx)
+        medium = dr.gather(mi.MediumPtr, dfr['med'], idx)
+
+        smp = mi.load_dict({'type': 'independent'})
+        smp.seed(dr.opaque(mi.UInt32, n ^ 0x9E3779B9), n)
+
+        mei = dr.zeros(mi.MediumInteraction3f, n)
+        mei.medium = medium
+        mei.p = origin
+
+        self._sample_segment_probes(scene, medium, channel, smp, mei,
+                                    origin, seg_dir, interval,
+                                    adj_trans, adj_scatt, nee_dir,
+                                    suffix_depth, mi.Bool(True),
+                                    include_indirect=not self.linear_cost)
 
     def _sample_segment_probes(self, scene, medium, channel, alt_sampler, mei,
                                seg_origin, seg_dir, interval, adj_trans, adj_scatt,
@@ -636,7 +741,8 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         inv_pdf = interval / n_probes
         with dr.resume_grad():
             if dr.hint(dr.grad_enabled(contribs), mode='scalar'):
-                dr.backward(dr.select(active, contribs, 0.0) * inv_pdf)
+                safe = active & dr.all(dr.isfinite(contribs))
+                dr.backward(dr.select(safe, contribs, 0.0) * inv_pdf)
 
         return mei_main
 
