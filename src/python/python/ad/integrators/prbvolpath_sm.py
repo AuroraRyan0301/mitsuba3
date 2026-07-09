@@ -233,8 +233,9 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # will receive the single, deferred recursive suffix path estimating
         # indirect in-scattered radiance. Weighted reservoir sampling with
         # RIS-style reweighting keeps the estimator unbiased.
-        res_wsum = mi.Spectrum(0.0)      # sum of reservoir weights seen
-        res_w = mi.Spectrum(0.0)         # weight of the retained sample
+        res_wsum = mi.Float(0.0)         # sum of scalar reservoir weights seen
+        res_w = mi.Spectrum(0.0)         # spectral throughput of the retained sample
+        res_v = mi.Float(0.0)            # scalar reservoir weight of that sample
         res_mei = dr.zeros(mi.MediumInteraction3f)  # retained probe location
         res_depth = mi.UInt32(0)         # suffix entry depth at that probe
         res_interval = mi.Float(0.0)     # retained segment length (inv. pdf)
@@ -405,11 +406,22 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                     #     probe in a throughput-weighted reservoir; the
                     #     deferred suffix is traced once, after the loop.
                     if dr.hint(self.linear_cost, mode='scalar'):
+                        # Reservoir with a *scalar* selection weight
+                        # (v = mean(w), additive, so P(keep i) = v_i/V exactly)
+                        # and *spectral* compensation w * (V / v_sel): the
+                        # per-channel expectation matches the quadratic
+                        # estimator exactly, even for strongly colored
+                        # throughput. Using mean(w/wsum) as the selection
+                        # probability while compensating per channel (as in
+                        # the original DRT reservoir) leaves a second-order
+                        # color bias.
                         w = dr.select(seg_end, dr.detach(throughput_seg), 0.0)
-                        res_wsum += w
-                        ratio = dr.mean(dr.select(res_wsum > 0, w / res_wsum, 0.0))
+                        v = dr.mean(w)
+                        res_wsum += v
+                        ratio = dr.select(res_wsum > 0, v / res_wsum, 0.0)
                         change = seg_end & (alt_sampler.next_1d(seg_end) <= ratio)
                         res_w[change] = w
+                        res_v[change] = v
                         res_mei[change] = mei_main
                         res_depth[change] = suffix_depth
                         res_interval[change] = interval
@@ -582,8 +594,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # unbiased (the transmittance and direct-light terms were already
         # deposited per segment).
         if dr.hint(not is_primal and self.linear_cost, mode='scalar'):
-            d = dr.mean(res_w)
-            w_out = dr.select(d > 0, dr.mean(res_wsum) * res_w / d, 0.0)
+            w_out = dr.select(res_v > 0, res_wsum * res_w / res_v, 0.0)
             fin_active = res_active & (res_depth < self.max_depth)
 
             phase_ctx = mi.PhaseFunctionContext(alt_sampler)
