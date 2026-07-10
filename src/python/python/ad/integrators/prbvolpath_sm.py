@@ -762,11 +762,21 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 ind_Li = self._probe_indirect(
                     scene, channel, alt_sampler, res_mei, phase_ctx, phase,
                     res_depth, fin_active)
+            # Evaluate the loop outputs feeding the backward below before
+            # traversing the AD graph: on the LLVM backend, running the eager
+            # backward on the still-unevaluated loop-exit graph silently
+            # drops part of the suffix gradient (CUDA is unaffected;
+            # observed as a -35% albedo gradient deficit that disappears
+            # with any forced evaluation).
+            dr.eval(res_active, res_wsum, res_w, res_v, res_interval,
+                    res_depth, ind_Li, δL, res_mei)
 
             with dr.resume_grad():
-                _, _, sigma_t_r = \
+                sigma_s_r, _, sigma_t_r = \
                     res_mei.medium.get_scattering_coefficients(res_mei, res_active)
-                albedo_r = res_mei.medium.get_albedo(res_mei, res_active)
+                # Attached albedo via sigma_s / sigma_t, as in
+                # _sample_segment_probes (one vcall less).
+                albedo_r = sigma_s_r / dr.maximum(sigma_t_r, 1e-8)
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)))
                 else:
