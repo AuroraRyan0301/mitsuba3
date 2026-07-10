@@ -150,7 +150,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # Python loop at all. For the C++-vs-nested-Python comparison.
         self.real_interaction_cpp = props.get('real_interaction_cpp', False)
         # Use the fused DDA+walk C++ variant (implies real_interaction_cpp)
-        self.real_interaction_fused = props.get('real_interaction_fused', False)
+        self.real_interaction_fused = props.get('real_interaction_fused', True)
         if self.real_interaction_fused:
             self.real_interaction_cpp = True
 
