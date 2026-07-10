@@ -140,6 +140,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # V_slot / v_sel. Exact (all segments kept) for paths with <= K
         # segments. Sits between the quadratic and linear variants.
         self.segment_reservoir = props.get('segment_reservoir', 0)
+        # Consume null collisions in a small nested loop instead of one outer
+        # (full-body) iteration per collision. Mechanism test for the
+        # accept-until-real design; estimator-equivalent (detached weights
+        # accumulated per hop).
+        self.null_inner_loop = props.get('null_inner_loop', False)
 
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
@@ -292,6 +297,37 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 needs_intersection &= ~active_medium
                 mei.t[active_medium & (si.t < mei.t)] = dr.inf
 
+                inner_sp = mi.Float(1.0)
+                inner_w = mi.Spectrum(1.0)   # null-hop weights (merged below)
+                if dr.hint(self.null_inner_loop and self.handle_null_scattering,
+                           mode='scalar'):
+                    # Walk across null collisions in a tiny nested loop; the
+                    # outer (fat) loop body then only ever sees real scatters
+                    # or escapes. Per-hop detached weights match the outer
+                    # implementation exactly.
+                    walk = active_medium & mei.is_valid()
+                    # The walk is fully detached (SM estimates sigma_t
+                    # derivatives via probes); suspend AD so the nested loop
+                    # carries no differentiable state.
+                    with dr.suspend_grad():
+                        while dr.hint(walk, label='Null-collision walk'):
+                            sp_h = dr.detach(dr.mean(mei.sigma_t / mei.combined_extinction))
+                            inner_sp[walk] = sp_h
+                            nul = walk & (sampler.next_1d(walk) >= sp_h)
+                            # null hop weight: (tr/pdf) * sigma_n / (1 - p)
+                            tr_h, pdf_h = medium.transmittance_eval_pdf(mei, si, nul)
+                            w_h = dr.select(index_spectrum(pdf_h, channel) > 0,
+                                            tr_h / index_spectrum(pdf_h, channel), 0.0)
+                            inner_w[nul] *= dr.detach(w_h * mei.sigma_n) / (1 - sp_h)
+                            ray.o[nul] = dr.detach(mei.p)
+                            si.t[nul] = si.t - dr.detach(mei.t)
+                            seg_dist[nul] = seg_dist + dr.detach(mei.t)
+                            u_h = sampler.next_1d(nul)
+                            mei[nul] = medium.sample_interaction(ray, u_h, channel, nul)
+                            mei.t = dr.detach(mei.t)
+                            mei.t[nul & (si.t < mei.t)] = dr.inf
+                            walk = nul & mei.is_valid()
+
                 # Sample matching: the free-flight/transmittance ratio is used
                 # *detached*. The sigma_t derivatives of the path prefix are
                 # estimated by the matched segment probes below instead, where
@@ -301,6 +337,10 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 tr_pdf = index_spectrum(free_flight_pdf, channel)
                 weight = mi.Spectrum(1.0)
                 weight[active_medium] *= dr.detach(dr.select(tr_pdf > 0.0, tr / tr_pdf, 0.0))
+                if dr.hint(self.null_inner_loop and self.handle_null_scattering,
+                           mode='scalar'):
+                    # Fold in the null-hop weights accumulated by the walk
+                    weight[active_medium] *= dr.detach(inner_w)
 
                 escaped_medium = active_medium & ~mei.is_valid()
                 active_medium &= mei.is_valid()
@@ -311,7 +351,13 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 nee_dir_sample = sampler.next_2d(active)
 
                 # Handle null and real scatter events
-                if dr.hint(self.handle_null_scattering, mode='scalar'):
+                if dr.hint(self.null_inner_loop and self.handle_null_scattering,
+                           mode='scalar'):
+                    # Inner walk already consumed all null collisions.
+                    scatter_prob = inner_sp
+                    act_null_scatter = mi.Bool(False)
+                    act_medium_scatter = active_medium
+                elif dr.hint(self.handle_null_scattering, mode='scalar'):
                     scatter_prob = dr.detach(dr.mean(mei.sigma_t / mei.combined_extinction))
                     act_null_scatter = (sampler.next_1d(active_medium) >= scatter_prob) & active_medium
                     act_medium_scatter = ~act_null_scatter & active_medium
