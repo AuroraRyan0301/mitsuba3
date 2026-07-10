@@ -480,6 +480,15 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                     seg_end &= dr.isfinite(interval)
                     interval = dr.select(seg_end, interval, 0.0)
                     suffix_depth = dr.select(escaped_medium, depth + 1, depth)
+                    # Overlap of the segment with the density grid's bbox
+                    # (probe domain; see _sample_segment_probes for why the
+                    # domain must exclude the out-of-grid clamp region).
+                    sbb_hit, sbb0, sbb1 = medium.intersect_aabb(
+                        mi.Ray3f(mi.Point3f(seg_origin), mi.Vector3f(ray.d)))
+                    seg_t0 = dr.detach(dr.clip(sbb0, 0.0, interval))
+                    seg_sub = dr.select(
+                        sbb_hit,
+                        dr.detach(dr.clip(sbb1, 0.0, interval)) - seg_t0, 0.0)
                     if dr.hint(defer, mode='scalar'):
                         # Append the segment record; probe estimation happens
                         # in the compact second-stage kernel after the loop.
@@ -523,8 +532,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         dr.scatter(dfr['med'], medium, slot, ok)
                         # Reservoir candidate for the deferred indirect suffix
                         # (linear variant): only the *location* is needed here.
+                        # Sampled from the bbox-clipped probe domain (matches
+                        # _sample_segment_probes).
                         mei_main = mi.MediumInteraction3f(mei)
-                        mei_main.t = alt_sampler.next_1d(seg_end) * interval
+                        mei_main.t = dr.fma(alt_sampler.next_1d(seg_end),
+                                            seg_sub, seg_t0)
                         mei_main.p = dr.fma(mi.Vector3f(ray.d), mei_main.t,
                                             mi.Point3f(seg_origin))
                     else:
@@ -559,7 +571,10 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         res_v[change] = v
                         res_mei[change] = mei_main
                         res_depth[change] = suffix_depth
-                        res_interval[change] = interval
+                        # Inverse pdf of the suffix location sample: the
+                        # bbox-clipped probe-domain length, NOT the full
+                        # segment length.
+                        res_interval[change] = seg_sub
                         res_active |= change
                     # =========================================================
 
@@ -761,7 +776,10 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                           * (δL * w_out) * ind_Li * res_interval
                 if dr.hint(dr.grad_enabled(contrib), mode='scalar'):
                     safe = res_active & dr.all(dr.isfinite(contrib))
-                    dr.backward(dr.select(safe, contrib, 0.0))
+                    # Evaluated context: keep graph edges (see
+                    # _sample_segment_probes).
+                    dr.backward(dr.select(safe, contrib, 0.0),
+                                flags=dr.ADFlag.ClearVertices)
 
         return L if is_primal else δL, valid_ray, [], L
 
@@ -847,6 +865,20 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         n_probes = self.probes_per_segment
         within = active & (suffix_depth < self.max_depth)
 
+        # Restrict the probe domain to the segment's overlap with the density
+        # grid's bounding box. Transport treats the region outside that box as
+        # vacuum (free flight), so the density derivative vanishes there —
+        # but Volume::eval() *clamps* lookup coordinates, so probing outside
+        # the box would deposit spurious gradients into the boundary voxels
+        # whenever the medium's shape extends beyond the grid.
+        seg_ray = mi.Ray3f(mi.Point3f(seg_origin), mi.Vector3f(seg_dir))
+        bb_hit, bb0, bb1 = medium.intersect_aabb(seg_ray)
+        t0 = dr.detach(dr.clip(bb0, 0.0, interval))
+        t1 = dr.detach(dr.clip(bb1, 0.0, interval))
+        sub_len = dr.select(active & bb_hit, t1 - t0, 0.0)
+        active = active & (sub_len > 0)
+        within &= active
+
         # Probe interactions inherit the frame/wavelengths/medium pointer of
         # the segment's medium interaction; only position/distance change.
         mei_sub = mi.MediumInteraction3f(mei)
@@ -858,7 +890,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         contribs = mi.Spectrum(0.0)
         mei_main = None
         for i in range(n_probes):
-            mei_sub.t = alt_sampler.next_1d(active) * interval
+            mei_sub.t = dr.fma(alt_sampler.next_1d(active), sub_len, t0)
             mei_sub.p = dr.fma(seg_dir, mei_sub.t, seg_origin)
 
             with dr.suspend_grad():
@@ -888,9 +920,13 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         phase_ctx, phase, nee_dir_sample, within)
 
             with dr.resume_grad():
-                _, _, sigma_t_sub = \
+                sigma_s_sub, _, sigma_t_sub = \
                     medium.get_scattering_coefficients(mei_sub, active)
-                albedo_sub = medium.get_albedo(mei_sub, active)
+                # Attached albedo derived from sigma_s / sigma_t: identical
+                # value (where sigma_t = 0, the albedo factor below is
+                # multiplied by detach(sigma_t) = 0 anyway) and saves a
+                # separate get_albedo() vcall.
+                albedo_sub = sigma_s_sub / dr.maximum(sigma_t_sub, 1e-8)
 
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     # Complement of the vertex-side power-heuristic weight
@@ -905,12 +941,21 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                              + mis_p * dr.detach(sigma_t_sub) * albedo_sub) \
                             * adj_scatt * Li
 
-        # Uniform probe placement: pdf = 1 / interval (per probe)
-        inv_pdf = interval / n_probes
+        # Uniform probe placement: pdf = 1 / sub_len (per probe)
+        inv_pdf = sub_len / n_probes
         with dr.resume_grad():
             if dr.hint(dr.grad_enabled(contribs), mode='scalar'):
                 safe = active & dr.all(dr.isfinite(contribs))
-                dr.backward(dr.select(safe, contribs, 0.0) * inv_pdf)
+                # This backward runs in an *evaluated* context (deferred
+                # flush), unlike the in-loop backward calls above, which are
+                # re-traced (and hence re-attached) on every render. The
+                # default ADFlag.ClearEdges would delete the persistent
+                # parameter->texture edges shared with subsequent renders in
+                # the same session, silently zeroing their gradients from the
+                # second render onward. Keep the graph; only clear vertex
+                # gradients.
+                dr.backward(dr.select(safe, contribs, 0.0) * inv_pdf,
+                            flags=dr.ADFlag.ClearVertices)
 
         return mei_main
 
