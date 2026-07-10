@@ -1,5 +1,6 @@
 #include <mitsuba/core/plugin.h>
 #include <mitsuba/core/properties.h>
+#include <mitsuba/core/random.h>
 #include <mitsuba/render/medium.h>
 #include <mitsuba/render/phase.h>
 #include <mitsuba/render/scene.h>
@@ -224,6 +225,253 @@ Medium<Float, Spectrum>::sample_interaction_dda(const Ray3f &ray, Float mint,
 
     Mask valid = active && (ls.majorant > 0.f);
     return { mint + ls.t_hit, ls.majorant, valid };
+}
+
+MI_VARIANT
+std::tuple<typename Medium<Float, Spectrum>::MediumInteraction3f,
+           typename Medium<Float, Spectrum>::UnpolarizedSpectrum, Float>
+Medium<Float, Spectrum>::sample_real_interaction(const Ray3f &ray, Float maxt,
+                                                 UInt32 seed, UInt32 channel,
+                                                 Mask _active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::MediumSample, _active);
+
+    using PCG32 = mitsuba::PCG32<UInt32>;
+    size_t n = dr::width(ray.o);
+
+    struct WalkState {
+        Mask active;
+        Ray3f ray;
+        Float t_acc;
+        Float maxt_rem;
+        MediumInteraction3f mei;
+        UnpolarizedSpectrum weight;
+        Float p_scatter;
+        PCG32 rng;
+        DRJIT_STRUCT(WalkState, active, ray, t_acc, maxt_rem, mei, weight,
+                     p_scatter, rng)
+    } ls = { _active,
+             ray,
+             Float(0.f),
+             maxt,
+             dr::zeros<MediumInteraction3f>(n),
+             UnpolarizedSpectrum(1.f),
+             Float(1.f),
+             PCG32(n, dr::uint64_array_t<Float>(seed)) };
+    /* Escaped lanes keep this initial interaction: it must carry valid
+       medium/wavelength/time fields (like sample_interaction's miss case)
+       so that downstream consumers -- e.g. gradient probes placed on the
+       escaping segment -- still evaluate the medium correctly. */
+    ls.mei.medium      = this;
+    ls.mei.wavelengths = ray.wavelengths;
+    ls.mei.time        = ray.time;
+    ls.mei.combined_extinction = get_majorant(ls.mei, _active);
+    ls.mei.t = dr::Infinity<Float>;
+
+    dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
+        [](const WalkState &ls) { return ls.active; },
+        [this, channel](WalkState &ls) {
+            Float u1 = ls.rng.next_float32(ls.active);
+            MediumInteraction3f mc =
+                sample_interaction(ls.ray, u1, channel, ls.active);
+
+            Mask escaped =
+                ls.active && (!mc.is_valid() || (mc.t > ls.maxt_rem));
+
+            UnpolarizedSpectrum kappa = mc.combined_extinction;
+            Float p = dr::mean(mc.sigma_t / kappa);
+            Float u2 = ls.rng.next_float32(ls.active);
+            Mask real   = ls.active && !escaped && (u2 < p);
+            Mask isnull = ls.active && !escaped && !real;
+
+            // Accept: keep the collision; t measures the total distance
+            // walked from the *original* ray origin.
+            dr::masked(ls.mei, real)       = mc;
+            dr::masked(ls.mei.t, real)     = ls.t_acc + mc.t;
+            dr::masked(ls.p_scatter, real) = p;
+            dr::masked(ls.weight, real)    = ls.weight * dr::rcp(kappa);
+
+            // Reject: accumulate the null-hop weight and advance the walk
+            dr::masked(ls.weight, isnull) =
+                ls.weight * mc.sigma_n / (kappa * (1.f - p));
+            dr::masked(ls.ray.o, isnull)    = mc.p;
+            dr::masked(ls.t_acc, isnull)    = ls.t_acc + mc.t;
+            dr::masked(ls.maxt_rem, isnull) = ls.maxt_rem - mc.t;
+
+            ls.active = isnull;
+        },
+        "Medium::sample_real_interaction");
+
+    return { ls.mei, ls.weight, ls.p_scatter };
+}
+
+MI_VARIANT
+std::tuple<typename Medium<Float, Spectrum>::MediumInteraction3f,
+           typename Medium<Float, Spectrum>::UnpolarizedSpectrum, Float>
+Medium<Float, Spectrum>::sample_real_interaction_fused(const Ray3f &ray,
+                                                       Float maxt_, UInt32 seed,
+                                                       UInt32 channel,
+                                                       Mask _active) const {
+    MI_MASKED_FUNCTION(ProfilerPhase::MediumSample, _active);
+
+    /* The fusion only concerns the majorant supergrid DDA; with a global
+       majorant the plain walk is already a single loop. */
+    if (!has_majorant_grid())
+        return sample_real_interaction(ray, maxt_, seed, channel, _active);
+    DRJIT_MARK_USED(channel);
+
+    using PCG32 = mitsuba::PCG32<UInt32>;
+    size_t n = dr::width(ray.o);
+
+    auto [aabb_its, mint, maxt] = intersect_aabb(ray);
+    aabb_its &= (dr::isfinite(mint) || dr::isfinite(maxt));
+    Mask active = _active && aabb_its;
+    dr::masked(mint, !active) = 0.f;
+    dr::masked(maxt, !active) = ray.maxt;
+    mint = dr::maximum(0.f, mint);
+    maxt = dr::minimum(maxt_, dr::minimum(ray.maxt, maxt));
+    Float t_end = maxt - mint;
+
+    /* Escaped lanes keep this interaction: valid medium/wavelength/time
+       fields, t = inf (mirrors sample_interaction's miss convention). */
+    MediumInteraction3f mei = dr::zeros<MediumInteraction3f>(n);
+    mei.medium      = this;
+    mei.wavelengths = ray.wavelengths;
+    mei.time        = ray.time;
+    mei.mint        = mint;
+    mei.combined_extinction = get_majorant(mei, _active);
+    mei.t = dr::Infinity<Float>;
+
+    ScalarVector3f res_f(m_majorant_grid_res);
+    ScalarVector3i res_i(m_majorant_grid_res);
+    uint32_t rx = m_majorant_grid_res.x(), ry = m_majorant_grid_res.y();
+
+    Point3f  o_g = (m_majorant_to_local * ray(mint)) * Vector3f(res_f);
+    Vector3f d_g = (m_majorant_to_local * ray.d) * Vector3f(res_f);
+    Vector3i step    = dr::select(d_g >= 0.f, 1, -1);
+    Vector3f t_delta = dr::rcp(dr::abs(d_g));
+    Vector3f next_b  = Vector3f(dr::clip(Vector3i(dr::floor(o_g)), 0,
+                                         res_i - 1) +
+                                dr::select(d_g >= 0.f, Vector3i(1),
+                                           Vector3i(0)));
+    Vector3f t_max0  = dr::select(d_g != 0.f, (next_b - o_g) / d_g,
+                                  dr::Infinity<Float>);
+
+    struct FusedState {
+        Mask active;
+        Mask needs_tau;
+        Vector3i cell;
+        Vector3f t_max;
+        Float t_cur;
+        Float tau_target;
+        Float tau_acc;
+        UnpolarizedSpectrum weight;
+        Float p_scatter;
+        Float t_hit;
+        Float kappa_hit;
+        UnpolarizedSpectrum ss, sn, st;
+        Mask found;
+        PCG32 rng;
+        DRJIT_STRUCT(FusedState, active, needs_tau, cell, t_max, t_cur,
+                     tau_target, tau_acc, weight, p_scatter, t_hit, kappa_hit,
+                     ss, sn, st, found, rng)
+    } ls = { active && (t_end > 0.f),
+             Mask(true),
+             dr::clip(Vector3i(dr::floor(o_g)), 0, res_i - 1),
+             t_max0,
+             Float(0.f),
+             Float(0.f),
+             Float(0.f),
+             UnpolarizedSpectrum(1.f),
+             Float(1.f),
+             dr::Infinity<Float>,
+             Float(0.f),
+             UnpolarizedSpectrum(0.f), UnpolarizedSpectrum(0.f),
+             UnpolarizedSpectrum(0.f),
+             Mask(false),
+             PCG32(n, dr::uint64_array_t<Float>(seed)) };
+
+    Ray3f ray_l(ray);
+    Float mint_l(mint);
+
+    dr::tie(ls) = dr::while_loop(dr::make_tuple(ls),
+        [](const FusedState &ls) { return ls.active; },
+        [this, rx, ry, res_i, step, t_delta, t_end, ray_l,
+         mint_l](FusedState &ls) {
+            // (1) Draw a fresh optical-depth target where needed
+            Float u_tau = ls.rng.next_float32(ls.active);
+            Mask fresh = ls.active && ls.needs_tau;
+            dr::masked(ls.tau_target, fresh) = -dr::log(1.f - u_tau);
+            dr::masked(ls.tau_acc, fresh)    = 0.f;
+            dr::masked(ls.needs_tau, ls.active) = false;
+
+            // (2) Extent and majorant of the current cell
+            UInt32 idx = (UInt32(ls.cell.z()) * ry + UInt32(ls.cell.y())) *
+                             rx + UInt32(ls.cell.x());
+            Float sigma  = dr::gather<Float>(m_majorant_grid, idx, ls.active);
+            Float t_next = dr::minimum(dr::min(ls.t_max), t_end);
+            Float dtau   = sigma * (t_next - ls.t_cur);
+            Mask reach   = ls.active && (sigma > 0.f) &&
+                           (ls.tau_acc + dtau >= ls.tau_target);
+
+            // (3) Tracking event inside the current cell: accept or reject
+            //     in place (the DDA cursor does not restart on rejection).
+            Float t_evt = ls.t_cur + (ls.tau_target - ls.tau_acc) / sigma;
+            MediumInteraction3f mc = dr::zeros<MediumInteraction3f>();
+            mc.medium      = this;
+            mc.wavelengths = ray_l.wavelengths;
+            mc.time        = ray_l.time;
+            mc.p           = ray_l(mint_l + t_evt);
+            auto [ss, sn, st] = get_scattering_coefficients(mc, reach);
+            UnpolarizedSpectrum kappa(sigma);
+            Float p     = dr::mean(st / kappa);
+            Float u_acc = ls.rng.next_float32(ls.active);
+            Mask real   = reach && (u_acc < p);
+            Mask isnull = reach && !real;
+
+            dr::masked(ls.found, real)      = true;
+            dr::masked(ls.t_hit, real)      = t_evt;
+            dr::masked(ls.kappa_hit, real)  = sigma;
+            dr::masked(ls.p_scatter, real)  = p;
+            dr::masked(ls.weight, real)     = ls.weight * dr::rcp(kappa);
+            dr::masked(ls.ss, real) = ss;
+            dr::masked(ls.sn, real) = sn;
+            dr::masked(ls.st, real) = st;
+
+            dr::masked(ls.weight, isnull) =
+                ls.weight * sn / (kappa * (1.f - p));
+            dr::masked(ls.t_cur, isnull)     = t_evt;
+            dr::masked(ls.needs_tau, isnull) = true;
+
+            // (4) No event in this cell: accumulate and advance the DDA
+            Mask adv = ls.active && !reach;
+            dr::masked(ls.tau_acc, adv) = ls.tau_acc + dtau;
+            dr::masked(ls.t_cur, adv)   = t_next;
+            Mask ax_x = adv && (ls.t_max.x() <= ls.t_max.y()) &&
+                        (ls.t_max.x() <= ls.t_max.z());
+            Mask ax_y = adv && !ax_x && (ls.t_max.y() <= ls.t_max.z());
+            Mask ax_z = adv && !ax_x && !ax_y;
+            dr::masked(ls.cell.x(), ax_x)  = ls.cell.x() + step.x();
+            dr::masked(ls.cell.y(), ax_y)  = ls.cell.y() + step.y();
+            dr::masked(ls.cell.z(), ax_z)  = ls.cell.z() + step.z();
+            dr::masked(ls.t_max.x(), ax_x) = ls.t_max.x() + t_delta.x();
+            dr::masked(ls.t_max.y(), ax_y) = ls.t_max.y() + t_delta.y();
+            dr::masked(ls.t_max.z(), ax_z) = ls.t_max.z() + t_delta.z();
+
+            Mask out = adv && ((t_next >= t_end) ||
+                               !dr::all((ls.cell >= 0) && (ls.cell < res_i)));
+            ls.active = ls.active && !real && !out;
+        },
+        "Medium::sample_real_interaction_fused");
+
+    dr::masked(mei.t, ls.found) = mint + ls.t_hit;
+    dr::masked(mei.p, ls.found) = ray(mint + ls.t_hit);
+    dr::masked(mei.combined_extinction, ls.found) =
+        UnpolarizedSpectrum(ls.kappa_hit);
+    dr::masked(mei.sigma_s, ls.found) = ls.ss;
+    dr::masked(mei.sigma_n, ls.found) = ls.sn;
+    dr::masked(mei.sigma_t, ls.found) = ls.st;
+
+    return { mei, ls.weight, ls.p_scatter };
 }
 
 MI_VARIANT

@@ -145,6 +145,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # accept-until-real design; estimator-equivalent (detached weights
         # accumulated per hop).
         self.null_inner_loop = props.get('null_inner_loop', False)
+        # Same mechanism, implemented as a C++ walk inside the Medium
+        # (Medium::sample_real_interaction): candidates never surface to the
+        # Python loop at all. For the C++-vs-nested-Python comparison.
+        self.real_interaction_cpp = props.get('real_interaction_cpp', False)
+        # Use the fused DDA+walk C++ variant (implies real_interaction_cpp)
+        self.real_interaction_fused = props.get('real_interaction_fused', False)
+        if self.real_interaction_fused:
+            self.real_interaction_cpp = True
 
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
@@ -286,16 +294,38 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 #--------------------- Sample medium interaction -------------------
 
                 # Handle medium sampling and potential medium escape
-                u = sampler.next_1d(active_medium)
-                mei = medium.sample_interaction(ray, u, channel, active_medium)
-                mei.t = dr.detach(mei.t)
+                if dr.hint(self.real_interaction_cpp and
+                           self.handle_null_scattering, mode='scalar'):
+                    # C++ walk: null collisions are consumed inside
+                    # Medium::sample_real_interaction; the loop body only
+                    # ever sees real scatters or escapes.
+                    intersect = needs_intersection & active_medium
+                    si[intersect] = scene.ray_intersect(ray, intersect)
+                    needs_intersection &= ~active_medium
+                    seed32 = mi.UInt32(sampler.next_1d(active_medium)
+                                       * 4294967040.0)
+                    with dr.suspend_grad():
+                        if dr.hint(self.real_interaction_fused, mode='scalar'):
+                            mei, w_cpp, sp_cpp = \
+                                medium.sample_real_interaction_fused(
+                                    ray, dr.detach(si.t), seed32, channel,
+                                    active_medium)
+                        else:
+                            mei, w_cpp, sp_cpp = medium.sample_real_interaction(
+                                ray, dr.detach(si.t), seed32, channel,
+                                active_medium)
+                    mei.t = dr.detach(mei.t)
+                else:
+                    u = sampler.next_1d(active_medium)
+                    mei = medium.sample_interaction(ray, u, channel, active_medium)
+                    mei.t = dr.detach(mei.t)
 
-                ray.maxt[active_medium & medium.is_homogeneous() & mei.is_valid()] = mei.t
-                intersect = needs_intersection & active_medium
-                si[intersect] = scene.ray_intersect(ray, intersect)
+                    ray.maxt[active_medium & medium.is_homogeneous() & mei.is_valid()] = mei.t
+                    intersect = needs_intersection & active_medium
+                    si[intersect] = scene.ray_intersect(ray, intersect)
 
-                needs_intersection &= ~active_medium
-                mei.t[active_medium & (si.t < mei.t)] = dr.inf
+                    needs_intersection &= ~active_medium
+                    mei.t[active_medium & (si.t < mei.t)] = dr.inf
 
                 inner_sp = mi.Float(1.0)
                 inner_w = mi.Spectrum(1.0)   # null-hop weights (merged below)
@@ -333,10 +363,19 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 # estimated by the matched segment probes below instead, where
                 # the transmittance and in-scattering terms share the same
                 # sample locations (activating their negative correlation).
-                tr, free_flight_pdf = medium.transmittance_eval_pdf(mei, si, active_medium)
-                tr_pdf = index_spectrum(free_flight_pdf, channel)
+                if dr.hint(self.real_interaction_cpp and
+                           self.handle_null_scattering, mode='scalar'):
+                    tr, tr_pdf = mi.Spectrum(1.0), mi.Float(1.0)  # in w_cpp
+                else:
+                    tr, free_flight_pdf = medium.transmittance_eval_pdf(mei, si, active_medium)
+                    tr_pdf = index_spectrum(free_flight_pdf, channel)
                 weight = mi.Spectrum(1.0)
-                weight[active_medium] *= dr.detach(dr.select(tr_pdf > 0.0, tr / tr_pdf, 0.0))
+                if dr.hint(self.real_interaction_cpp and
+                           self.handle_null_scattering, mode='scalar'):
+                    # The C++ walk already includes all hop factors
+                    weight[active_medium] *= dr.detach(w_cpp)
+                else:
+                    weight[active_medium] *= dr.detach(dr.select(tr_pdf > 0.0, tr / tr_pdf, 0.0))
                 if dr.hint(self.null_inner_loop and self.handle_null_scattering,
                            mode='scalar'):
                     # Fold in the null-hop weights accumulated by the walk
@@ -351,7 +390,12 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 nee_dir_sample = sampler.next_2d(active)
 
                 # Handle null and real scatter events
-                if dr.hint(self.null_inner_loop and self.handle_null_scattering,
+                if dr.hint(self.real_interaction_cpp and
+                           self.handle_null_scattering, mode='scalar'):
+                    scatter_prob = sp_cpp
+                    act_null_scatter = mi.Bool(False)
+                    act_medium_scatter = active_medium
+                elif dr.hint(self.null_inner_loop and self.handle_null_scattering,
                            mode='scalar'):
                     # Inner walk already consumed all null collisions.
                     scatter_prob = inner_sp

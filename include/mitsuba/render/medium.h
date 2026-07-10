@@ -69,6 +69,42 @@ public:
                                            UInt32 channel, Mask active) const;
 
     /**
+     * \brief Sample the next *real* medium interaction along a ray,
+     * consuming any number of null collisions in an internal loop.
+     *
+     * Candidates are drawn with \ref sample_interaction() and accepted with
+     * probability mean(sigma_t / majorant). The method returns a tuple
+     * (mei, weight, scatter_prob):
+     *
+     * - \c mei: the accepted collision, with \c mei.t measuring the *total*
+     *   distance from \c ray.o (invalid if the walk exceeded \c maxt, i.e.
+     *   the ray left the medium before a real collision occurred).
+     * - \c weight: the product of all null-hop weights
+     *   sigma_n / (majorant * (1 - p)) and the real hop's 1 / majorant
+     *   factor. Multiplying by sigma_s / p at the vertex reconstructs the
+     *   usual weighted next-flight estimator exactly.
+     * - \c scatter_prob: the acceptance probability at the returned
+     *   collision (for the sigma_s / p vertex weight).
+     *
+     * The per-hop random numbers come from an internal PCG32 stream
+     * initialized with \c seed (one lane-wide seed suffices).
+     */
+    std::tuple<MediumInteraction3f, UnpolarizedSpectrum, Float>
+    sample_real_interaction(const Ray3f &ray, Float maxt, UInt32 seed,
+                            UInt32 channel, Mask active) const;
+
+    /**
+     * \brief Fused variant of \ref sample_real_interaction(): the DDA
+     * traversal of the majorant supergrid and the null-collision walk run in
+     * a *single* loop (the DDA cursor never restarts; rejected collisions
+     * draw a fresh optical-depth target and continue in place). Same
+     * return convention as \ref sample_real_interaction().
+     */
+    std::tuple<MediumInteraction3f, UnpolarizedSpectrum, Float>
+    sample_real_interaction_fused(const Ray3f &ray, Float maxt, UInt32 seed,
+                                  UInt32 channel, Mask active) const;
+
+    /**
      * \brief Compute the transmittance and PDF
      *
      * This function evaluates the transmittance and PDF of sampling a certain
@@ -181,6 +217,8 @@ DRJIT_CALL_TEMPLATE_BEGIN(mitsuba::Medium)
     DRJIT_CALL_METHOD(get_albedo)
     DRJIT_CALL_METHOD(intersect_aabb)
     DRJIT_CALL_METHOD(sample_interaction)
+    DRJIT_CALL_METHOD(sample_real_interaction)
+    DRJIT_CALL_METHOD(sample_real_interaction_fused)
     DRJIT_CALL_METHOD(transmittance_eval_pdf)
     DRJIT_CALL_METHOD(get_scattering_coefficients)
 DRJIT_CALL_END()
