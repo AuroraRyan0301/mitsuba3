@@ -133,6 +133,13 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # Records past the capacity are dropped (with a warning); the default
         # is far above typical volumetric path lengths.
         self.defer_capacity = props.get('defer_capacity', 16)
+        # K-slot striped segment reservoir (0 = record every segment).
+        # Per lane, segment k goes to slot (k mod K); each slot runs a
+        # single weighted reservoir. Bounded memory/cost: at most K segments
+        # per path receive probes + a recursive suffix, with RIS compensation
+        # V_slot / v_sel. Exact (all segments kept) for paths with <= K
+        # segments. Sits between the quadratic and linear variants.
+        self.segment_reservoir = props.get('segment_reservoir', 0)
 
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
@@ -217,6 +224,15 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             dfr = {k: dr.zeros(mi.Float, dfr_cap) for k in
                    ('ox', 'oy', 'oz', 'dx', 'dy', 'dz', 'itv',
                     'atx', 'aty', 'atz', 'asx', 'asy', 'asz', 'nu', 'nv')}
+            K_res = self.segment_reservoir
+            if dr.hint(K_res > 0, mode='scalar'):
+                dfr_cap = int(dfr_n) * K_res
+                dfr = {k: dr.zeros(mi.Float, dfr_cap) for k in dfr}
+                dfr['vsl'] = dr.zeros(mi.Float, dfr_cap)   # scalar v of retained
+                dfr['Vj'] = dr.zeros(mi.Float, dfr_cap)    # slot weight sum (post-loop)
+                if K_res != 4:
+                    raise Exception('segment_reservoir currently supports K=4')
+                lane_idx = dr.arange(mi.UInt32, dfr_n)
             dfr['dep'] = dr.zeros(mi.UInt32, dfr_cap)
             dfr['ch'] = dr.zeros(mi.UInt32, dfr_cap)
             dfr['med'] = dr.zeros(mi.MediumPtr, dfr_cap)
@@ -240,6 +256,12 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         res_depth = mi.UInt32(0)         # suffix entry depth at that probe
         res_interval = mi.Float(0.0)     # retained segment length (inv. pdf)
         res_active = mi.Bool(False)      # reservoir holds a valid sample
+        # K=4 striped segment reservoir (see `segment_reservoir`): loop-state
+        # variables must be unconditionally initialized at function scope for
+        # @dr.syntax to thread them through the symbolic loop.
+        seg_ctr = mi.UInt32(0)
+        res_V0 = mi.Float(0.0); res_V1 = mi.Float(0.0)
+        res_V2 = mi.Float(0.0); res_V3 = mi.Float(0.0)
 
         while dr.hint(active,
                       label=f"PRB Sample Matching ({mode.name})"):
@@ -373,8 +395,31 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         # in the compact second-stage kernel after the loop.
                         at = dr.detach(δL * L)
                         asc = dr.detach(δL * throughput_seg)
-                        slot = dr.scatter_inc(dfr_ctr, mi.UInt32(0), seg_end)
-                        ok = seg_end & (slot < dfr_cap_o)
+                        if dr.hint(self.segment_reservoir > 0, mode='scalar'):
+                            # K-slot striped reservoir: slot = seg index mod K
+                            slot_id = seg_ctr % 4
+                            seg_ctr[seg_end] = seg_ctr + 1
+                            v = dr.mean(dr.detach(throughput_seg))
+                            u_res = alt_sampler.next_1d(seg_end)
+                            m0 = seg_end & (slot_id == 0)
+                            m1 = seg_end & (slot_id == 1)
+                            m2 = seg_end & (slot_id == 2)
+                            m3 = seg_end & (slot_id == 3)
+                            res_V0 = res_V0 + dr.select(m0, v, 0.0)
+                            res_V1 = res_V1 + dr.select(m1, v, 0.0)
+                            res_V2 = res_V2 + dr.select(m2, v, 0.0)
+                            res_V3 = res_V3 + dr.select(m3, v, 0.0)
+                            Vmine = dr.select(m0, res_V0,
+                                    dr.select(m1, res_V1,
+                                    dr.select(m2, res_V2, res_V3)))
+                            r = dr.select(Vmine > 0, v / Vmine, 0.0)
+                            change = seg_end & (u_res <= r)
+                            slot = lane_idx * 4 + slot_id
+                            ok = change
+                            dr.scatter(dfr['vsl'], v, slot, ok)
+                        else:
+                            slot = dr.scatter_inc(dfr_ctr, mi.UInt32(0), seg_end)
+                            ok = seg_end & (slot < dfr_cap_o)
                         for _k, _v in (('ox', seg_origin.x), ('oy', seg_origin.y),
                                        ('oz', seg_origin.z), ('dx', ray.d.x),
                                        ('dy', ray.d.y), ('dz', ray.d.z),
@@ -584,7 +629,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         # ---- Deferred-probe pass: estimate probe lighting in a compact,
         # coherent kernel of its own (records were appended in the loop). ----
         if dr.hint(defer, mode='scalar'):
-            self._flush_deferred_probes(scene, dfr, dfr_ctr, dfr_cap)
+            if dr.hint(self.segment_reservoir > 0, mode='scalar'):
+                for _j, _V in ((0, res_V0), (1, res_V1),
+                               (2, res_V2), (3, res_V3)):
+                    dr.scatter(dfr['Vj'], _V, lane_idx * 4 + _j)
+                self._flush_deferred_probes(scene, dfr, None, dfr_cap,
+                                            reservoir=True)
+            else:
+                self._flush_deferred_probes(scene, dfr, dfr_ctr, dfr_cap)
 
         # ---- Linear-cost variant: deferred indirect in-scattering probe ----
         # Trace the single recursive suffix path at the reservoir-selected
@@ -623,7 +675,8 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
         return L if is_primal else δL, valid_ray, [], L
 
-    def _flush_deferred_probes(self, scene, dfr, dfr_ctr, dfr_cap):
+    def _flush_deferred_probes(self, scene, dfr, dfr_ctr, dfr_cap,
+                               reservoir=False):
         """
         Second stage of the deferred-probe design: gather the per-segment
         records written by the path-replay loop and run the (ray-tracing
@@ -631,8 +684,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         counter forces the replay kernel to execute first, so the probe work
         lands in a separate, much smaller kernel with compacted lanes.
         """
-        n_total = int(dfr_ctr[0])
-        n = min(n_total, dfr_cap)
+        if reservoir:
+            n_total = n = dfr_cap      # fixed lane*K layout, no counter
+        else:
+            n_total = int(dfr_ctr[0])
+            n = min(n_total, dfr_cap)
         if n_total > dfr_cap:
             mi.Log(mi.LogLevel.Warn,
                    f'prbvolpath_sm: deferred-probe buffer overflow '
@@ -652,6 +708,16 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         channel = dr.gather(mi.UInt32, dfr['ch'], idx)
         medium = dr.gather(mi.MediumPtr, dfr['med'], idx)
 
+        active = mi.Bool(True)
+        if reservoir:
+            # RIS compensation: the retained segment stands in for its slot's
+            # whole group; occupied slots have v_sel > 0.
+            vsl = g('vsl'); Vj = g('Vj')
+            active = vsl > 0
+            comp = dr.select(active, Vj / dr.maximum(vsl, 1e-30), 0.0)
+            adj_trans *= comp
+            adj_scatt *= comp
+
         smp = mi.load_dict({'type': 'independent'})
         smp.seed(dr.opaque(mi.UInt32, n ^ 0x9E3779B9), n)
 
@@ -662,8 +728,9 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         self._sample_segment_probes(scene, medium, channel, smp, mei,
                                     origin, seg_dir, interval,
                                     adj_trans, adj_scatt, nee_dir,
-                                    suffix_depth, mi.Bool(True),
-                                    include_indirect=not self.linear_cost)
+                                    suffix_depth, active,
+                                    include_indirect=(reservoir or
+                                                      not self.linear_cost))
 
     def _sample_segment_probes(self, scene, medium, channel, alt_sampler, mei,
                                seg_origin, seg_dir, interval, adj_trans, adj_scatt,
