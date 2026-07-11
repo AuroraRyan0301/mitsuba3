@@ -262,6 +262,8 @@ Medium<Float, Spectrum>::sample_real_interaction(const Ray3f &ray, Float maxt,
        so that downstream consumers -- e.g. gradient probes placed on the
        escaping segment -- still evaluate the medium correctly. */
     ls.mei.medium      = this;
+    ls.mei.wi          = -ray.d;
+    ls.mei.sh_frame    = Frame3f(ls.mei.wi);
     ls.mei.wavelengths = ray.wavelengths;
     ls.mei.time        = ray.time;
     ls.mei.combined_extinction = get_majorant(ls.mei, _active);
@@ -335,6 +337,8 @@ Medium<Float, Spectrum>::sample_real_interaction_fused(const Ray3f &ray,
        fields, t = inf (mirrors sample_interaction's miss convention). */
     MediumInteraction3f mei = dr::zeros<MediumInteraction3f>(n);
     mei.medium      = this;
+    mei.wi          = -ray.d;
+    mei.sh_frame    = Frame3f(mei.wi);
     mei.wavelengths = ray.wavelengths;
     mei.time        = ray.time;
     mei.mint        = mint;
