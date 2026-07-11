@@ -154,8 +154,25 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
         if self.real_interaction_fused:
             self.real_interaction_cpp = True
 
+        if mi.is_polarized:
+            raise Exception('PRBVolpathSMIntegrator does not support '
+                            'polarized variants!')
         if self.probes_per_segment < 1:
             raise Exception('"probes_per_segment" must be >= 1')
+        if self.defer_capacity < 1:
+            raise Exception('"defer_capacity" must be >= 1')
+        if self.segment_reservoir not in (0, 4):
+            raise Exception('"segment_reservoir" must be 0 (record every '
+                            'segment) or 4 (striped K=4 reservoir)')
+        if self.segment_reservoir > 0 and self.linear_cost:
+            raise Exception('"segment_reservoir" and "linear_cost" are '
+                            'mutually exclusive suffix-subsampling schemes')
+        if self.null_inner_loop and self.real_interaction_cpp:
+            mi.Log(mi.LogLevel.Warn,
+                   'prbvolpath_sm: "null_inner_loop" has no effect while the '
+                   'C++ real-interaction walk is enabled (the default); set '
+                   '"real_interaction_fused" and "real_interaction_cpp" to '
+                   'false to use the nested Python walk.')
 
     @dr.syntax
     def sample(self,
@@ -243,8 +260,6 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 dfr = {k: dr.zeros(mi.Float, dfr_cap) for k in dfr}
                 dfr['vsl'] = dr.zeros(mi.Float, dfr_cap)   # scalar v of retained
                 dfr['Vj'] = dr.zeros(mi.Float, dfr_cap)    # slot weight sum (post-loop)
-                if K_res != 4:
-                    raise Exception('segment_reservoir currently supports K=4')
                 lane_idx = dr.arange(mi.UInt32, dfr_n)
             dfr['dep'] = dr.zeros(mi.UInt32, dfr_cap)
             dfr['ch'] = dr.zeros(mi.UInt32, dfr_cap)
