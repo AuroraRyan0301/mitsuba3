@@ -498,6 +498,12 @@ Medium<Float, Spectrum>::get_albedo(const MediumInteraction3f &mi,
                                     Mask active) const {
     MI_MASKED_FUNCTION(ProfilerPhase::MediumEvaluate, active);
 
+    /* Fallback only — returns 0 where sigma_t = 0, which is generally NOT
+       the medium's albedo there. Differentiable integrators that attach the
+       scatter term through this value lose d(sigma_t*albedo)/dsigma_t =
+       albedo in empty regions (see prbvolpath_sm). Media with an explicit
+       albedo (heterogeneous, homogeneous) override this with a direct
+       volume/value lookup; new Medium subclasses should do the same. */
     auto [sigma_s, sigma_n, sigma_t] = get_scattering_coefficients(mi, active);
     return dr::select(sigma_t > 0.f, sigma_s / sigma_t, 0.f);
 }
