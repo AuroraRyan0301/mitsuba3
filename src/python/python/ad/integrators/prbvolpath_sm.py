@@ -789,9 +789,11 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             with dr.resume_grad():
                 sigma_s_r, _, sigma_t_r = \
                     res_mei.medium.get_scattering_coefficients(res_mei, res_active)
-                # Attached albedo via sigma_s / sigma_t, as in
-                # _sample_segment_probes (one vcall less).
-                albedo_r = sigma_s_r / dr.maximum(sigma_t_r, 1e-8)
+                # get_albedo(), not sigma_s / max(sigma_t, eps): the ratio is
+                # 0 in empty voxels where the true albedo (and the scatter
+                # term's sigma_t-derivative) is not — see
+                # _sample_segment_probes.
+                albedo_r = res_mei.medium.get_albedo(res_mei, res_active)
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)))
                 else:
@@ -947,11 +949,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             with dr.resume_grad():
                 sigma_s_sub, _, sigma_t_sub = \
                     medium.get_scattering_coefficients(mei_sub, active)
-                # Attached albedo derived from sigma_s / sigma_t: identical
-                # value (where sigma_t = 0, the albedo factor below is
-                # multiplied by detach(sigma_t) = 0 anyway) and saves a
-                # separate get_albedo() vcall.
-                albedo_sub = sigma_s_sub / dr.maximum(sigma_t_sub, 1e-8)
+                # The albedo must come from get_albedo(), NOT from the ratio
+                # sigma_s / max(sigma_t, eps): where sigma_t(y) = 0 the ratio
+                # is 0 while the true albedo is not, and the scatter term's
+                # d(sigma_t * albedo)/dsigma_t = albedo is nonzero exactly
+                # there. The ratio silently zeroes the positive in-scattering
+                # gradient in empty voxels (+69% <g,1> bias on a 256-cubed
+                # cloud; invisible to <g,sigma>-weighted tests).
+                albedo_sub = medium.get_albedo(mei_sub, active)
 
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     # Complement of the vertex-side power-heuristic weight
