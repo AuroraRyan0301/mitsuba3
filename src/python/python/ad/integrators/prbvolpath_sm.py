@@ -787,7 +787,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                     res_depth, ind_Li, δL, res_mei)
 
             with dr.resume_grad():
-                sigma_s_r, _, sigma_t_r = \
+                _, _, sigma_t_r = \
                     res_mei.medium.get_scattering_coefficients(res_mei, res_active)
                 # get_albedo(), not sigma_s / max(sigma_t, eps): the ratio is
                 # 0 in empty voxels where the true albedo (and the scatter
@@ -947,7 +947,7 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                         phase_ctx, phase, nee_dir_sample, within)
 
             with dr.resume_grad():
-                sigma_s_sub, _, sigma_t_sub = \
+                _, _, sigma_t_sub = \
                     medium.get_scattering_coefficients(mei_sub, active)
                 # The albedo must come from get_albedo(), NOT from the ratio
                 # sigma_s / max(sigma_t, eps): where sigma_t(y) = 0 the ratio
