@@ -472,7 +472,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                     # (1) Vertex-side albedo derivative, MIS-combined with the
                     #     probe-side estimator (power heuristic, sigma_t^2).
                     if dr.hint(self.use_probe_mis and dr.grad_enabled(albedo_v), mode='scalar'):
-                        s2 = dr.square(mei.sigma_t)
+                        # Power-heuristic density of the vertex estimator is
+                        # its *informative* sample density, sigma_s = sigma_t
+                        # * albedo — not sigma_t: the replayed signal carries
+                        # an albedo factor, so at albedo = 0 the vertex side
+                        # has no information and its weight must vanish
+                        # (otherwise those voxels lose the vertex share of
+                        # their albedo gradient entirely).
+                        s2 = dr.square(mei.sigma_t * dr.detach(albedo_v))
                         mis_v = s2 / (1 + s2)
                         Lo_alb = dr.detach(dr.select(
                             seg_end_scatter,
@@ -795,7 +802,10 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
                 # _sample_segment_probes.
                 albedo_r = res_mei.medium.get_albedo(res_mei, res_active)
                 if dr.hint(self.use_probe_mis, mode='scalar'):
-                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)))
+                    # Complement of the vertex weight: density = sigma_s
+                    # (see the vertex-side comment).
+                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_r)
+                                                 * dr.detach(albedo_r)))
                 else:
                     mis_p = mi.Spectrum(1.0)
                 contrib = (sigma_t_r * dr.detach(albedo_r)
@@ -960,7 +970,9 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
 
                 if dr.hint(self.use_probe_mis, mode='scalar'):
                     # Complement of the vertex-side power-heuristic weight
-                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_sub)))
+                    # (density = sigma_s, see the vertex-side comment).
+                    mis_p = dr.rcp(1 + dr.square(dr.detach(sigma_t_sub)
+                                                 * dr.detach(albedo_sub)))
                 else:
                     mis_p = mi.Spectrum(1.0)
 
