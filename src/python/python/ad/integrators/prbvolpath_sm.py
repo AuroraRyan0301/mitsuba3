@@ -787,11 +787,14 @@ class PRBVolpathSMIntegrator(PRBVolpathIntegrator):
             # Evaluate the loop outputs feeding the backward below before
             # traversing the AD graph: on the LLVM backend, running the eager
             # backward on the still-unevaluated loop-exit graph silently
-            # drops part of the suffix gradient (CUDA is unaffected;
-            # observed as a -35% albedo gradient deficit that disappears
-            # with any forced evaluation).
-            dr.eval(res_active, res_wsum, res_w, res_v, res_interval,
-                    res_depth, ind_Li, δL, res_mei)
+            # drops part of the suffix gradient (observed as a -35% albedo
+            # gradient deficit that disappears with any forced evaluation).
+            # CUDA is unaffected and the materialization is not free there
+            # (extra memory round-trip, +17% linear-variant adjoint time),
+            # so only the LLVM backend pays it.
+            if dr.hint('llvm' in mi.variant(), mode='scalar'):
+                dr.eval(res_active, res_wsum, res_w, res_v, res_interval,
+                        res_depth, ind_Li, δL, res_mei)
 
             with dr.resume_grad():
                 _, _, sigma_t_r = \
