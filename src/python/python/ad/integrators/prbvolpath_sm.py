@@ -79,10 +79,6 @@ class PRBVolpathSMIntegrator(RBIntegrator):
        - Specifies the path depth, at which the implementation will begin to use
          the *russian roulette* path termination criterion. (Default: 5)
 
-     * - hide_emitters
-       - |bool|
-       - Hide directly visible emitters. (Default: no, i.e. |false|)
-
      * - gradient_samples_per_segment
        - |int|
        - Number of gradient samples placed on each path segment inside a
@@ -258,6 +254,9 @@ class PRBVolpathSMIntegrator(RBIntegrator):
             active &= (sampler.next_1d(active) < q) | ~perform_rr
             throughput[perform_rr] = throughput * dr.rcp(q)
 
+            # Camera rays trace with the camera mask, which hides emitters marked as invisible
+            ray_mask = dr.select(depth == 0, mi.RayMask.Camera, mi.RayMask.All)
+
             active_medium = active & (medium != None)
             active_surface = active & ~active_medium
 
@@ -268,7 +267,9 @@ class PRBVolpathSMIntegrator(RBIntegrator):
                 # loop only sees real scattering events and escapes
                 if dr.hint(self.handle_null_scattering, mode='scalar'):
                     intersect = needs_intersection & active_medium
-                    si[intersect] = scene.ray_intersect(ray, intersect)
+                    si[intersect] = scene.ray_intersect(
+                        ray, mi.RayFlags.Default, False, intersect,
+                        visibility_mask=ray_mask)
                     needs_intersection &= ~active_medium
                     with dr.suspend_grad():
                         mei, w_walk, scatter_prob = self.sample_real_interaction(
@@ -282,7 +283,9 @@ class PRBVolpathSMIntegrator(RBIntegrator):
                     mei.t = dr.detach(mei.t)
                     ray.maxt[active_medium & medium.is_homogeneous() & mei.is_valid()] = mei.t
                     intersect = needs_intersection & active_medium
-                    si[intersect] = scene.ray_intersect(ray, intersect)
+                    si[intersect] = scene.ray_intersect(
+                        ray, mi.RayFlags.Default, False, intersect,
+                        visibility_mask=ray_mask)
                     needs_intersection &= ~active_medium
                     mei.t[active_medium & (si.t < mei.t)] = dr.inf
 
@@ -376,31 +379,17 @@ class PRBVolpathSMIntegrator(RBIntegrator):
 
                 active_surface |= escaped_medium
                 intersect = active_surface & needs_intersection
-                si[intersect] = scene.ray_intersect(ray, intersect)
-
-                # ---------------------- Hide area emitters ----------------------
-
-                if dr.hint(self.hide_emitters, mode='scalar'):
-                    # Are we on the first segment and did we hit an area emitter?
-                    # If so, skip all area emitters along this ray
-                    skip_emitters = (
-                        si.is_valid() &
-                        (si.shape.emitter() != None) &
-                        (depth == 0) &
-                        intersect
-                    )
-
-                    ray_skip = si.spawn_ray(ray.d)
-                    pi = self.skip_area_emitters(scene, ray_skip, True, skip_emitters)
-                    si_after_skip = pi.compute_surface_interaction(ray, mi.RayFlags.Default, skip_emitters)
-                    si[skip_emitters] = si_after_skip
+                si[intersect] = scene.ray_intersect(
+                    ray, mi.RayFlags.Default, False, intersect,
+                    visibility_mask=ray_mask)
 
                 # ----------------- Intersection with emitters -----------------
 
                 ray_from_camera = active_surface & (depth == 0)
                 count_direct = ray_from_camera | specular_chain
-                emitter = si.emitter(scene)
-                active_e = active_surface & (emitter != None) & ~((depth == 0) & self.hide_emitters)
+                # The same mask hides an invisible environment from escaped camera rays
+                emitter = si.emitter(scene, visibility_mask=ray_mask)
+                active_e = active_surface & (emitter != None)
 
                 # Get the PDF of sampling this emitter using next event estimation
                 ds = mi.DirectionSample3f(scene, si, last_scatter_event)
